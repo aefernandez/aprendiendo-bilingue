@@ -12,7 +12,16 @@ const LEVELS: { value: Level; label: string; description: string }[] = [
 interface ActiveWord {
   text: string;
   translation: string;
-  index: number;
+}
+
+// Split a target-language segment into individual tappable words,
+// preserving punctuation as non-tappable trailing characters.
+function tokenize(segment: Segment): { word: string; punct: string }[] {
+  return segment.text.split(/\s+/).filter(Boolean).map((token) => {
+    const match = token.match(/^([\p{L}\p{M}'-]+)([\p{P}\p{S}]*)$/u);
+    if (match) return { word: match[1], punct: match[2] };
+    return { word: token, punct: '' };
+  });
 }
 
 export default function Home() {
@@ -47,16 +56,6 @@ export default function Home() {
     } finally {
       setLoading(false);
     }
-  }
-
-  function handleWordTap(segment: Segment, index: number) {
-    if (segment.lang !== 'target' || !segment.translation) return;
-
-    setActiveWord(
-      activeWord?.index === index
-        ? null
-        : { text: segment.text, translation: segment.translation, index }
-    );
   }
 
   return (
@@ -132,30 +131,47 @@ export default function Home() {
           </div>
 
           <p className="text-lg leading-relaxed text-gray-900">
-            {segments.map((segment, index) =>
-              segment.lang === 'target' ? (
-                <button
-                  key={index}
-                  onClick={() => handleWordTap(segment, index)}
-                  className={`inline rounded px-0.5 -mx-0.5 transition-colors ${
-                    activeWord?.index === index
-                      ? 'bg-amber-500 text-white'
-                      : 'bg-amber-100 text-amber-900 hover:bg-amber-200'
-                  }`}
-                >
-                  {segment.text}
-                </button>
-              ) : (
-                <span key={index}>{segment.text}</span>
-              )
-            )}
+            {segments.map((segment, segIndex) => {
+              if (segment.lang === 'source') {
+                return <span key={segIndex}>{segment.text}</span>;
+              }
+
+              // Target segment: render each word as individually tappable
+              const tokens = tokenize(segment);
+              return (
+                <span key={segIndex}>
+                  {tokens.map(({ word, punct }, tokenIndex) => (
+                    <span key={tokenIndex}>
+                      <button
+                        onClick={() =>
+                          setActiveWord(
+                            activeWord?.text === word
+                              ? null
+                              : { text: word, translation: segment.translation ?? '' }
+                          )
+                        }
+                        className={`inline rounded px-0.5 -mx-0.5 transition-colors ${
+                          activeWord?.text === word
+                            ? 'bg-amber-500 text-white'
+                            : 'bg-amber-100 text-amber-900 hover:bg-amber-200'
+                        }`}
+                      >
+                        {word}
+                      </button>
+                      {punct}
+                      {tokenIndex < tokens.length - 1 ? ' ' : ''}
+                    </span>
+                  ))}
+                </span>
+              );
+            })}
           </p>
         </div>
       )}
 
       {/* Definition card */}
       {activeWord && (
-        <div className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-100 shadow-xl p-6">
+        <div className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 shadow-xl p-6">
           <div className="max-w-2xl mx-auto flex items-start justify-between">
             <div>
               <p className="text-xl font-semibold text-gray-900">{activeWord.text}</p>

@@ -2,13 +2,13 @@ import type { Level, Segment } from './types';
 
 const SYSTEM_PROMPT = `You are a language-mixing engine. You take text in a source language and partially replace some phrases with their equivalent in a target language, producing a MIXED-language text. The source language must remain dominant — you are NOT translating the text, you are sprinkling in target-language phrases.
 
-The user selects one of three levels:
+The user selects one of three levels. Treat each percentage as a MINIMUM FLOOR — you must meet or exceed it. When in doubt, swap more, not less.
 
-Level 1 — "Dipping In": Replace only the most common, everyday vocabulary (~30% of words). Basic nouns (house, food, water), common verbs (to go, to have, to want). The output should be mostly source language with a few target-language words sprinkled in.
+Level 1 — "Dipping In": At least 30% of words must be in the target language. Swap the most common, everyday vocabulary: basic nouns (house, food, water), common verbs (to go, to have, to want), simple adjectives, short phrases.
 
-Level 2 — "Wading In": Replace a substantial portion (~60% of words). Include less common vocabulary, longer phrases, and some full clauses. The source language still provides scaffolding.
+Level 2 — "Wading In": At least 60% of words must be in the target language. Swap most vocabulary including less common words, longer phrases, and full clauses. Source language provides light scaffolding only.
 
-Level 3 — "Deep End": Replace nearly everything (~90% of words). Only complex idioms, technical jargon, or rare vocabulary stays in the source language.
+Level 3 — "Deep End": At least 90% of words must be in the target language. Swap nearly everything — only leave complex idioms, technical jargon, or rare vocabulary in the source language.
 
 Rules:
 - CRITICAL: Source-language segments must contain the EXACT original text, copied verbatim. Do not rephrase or alter source-language text.
