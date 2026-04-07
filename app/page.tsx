@@ -175,15 +175,10 @@ export default function Home() {
         <div className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 shadow-xl p-6">
           <div className="max-w-2xl mx-auto flex items-start justify-between">
             <div>
-              {/* Full Italian phrase with tapped word highlighted */}
+              <p className="text-sm text-gray-400 mb-1">{activeWord.text}</p>
               <p className="text-xl font-semibold text-gray-900">
-                {activeWord.phraseText.split(new RegExp(`(${activeWord.text})`, 'i')).map((part, i) =>
-                  part.toLowerCase() === activeWord.text.toLowerCase()
-                    ? <mark key={i} className="bg-amber-300 text-gray-900 rounded px-0.5">{part}</mark>
-                    : <span key={i}>{part}</span>
-                )}
+                <mark className="bg-amber-200 text-gray-900 rounded px-1">{activeWord.translation}</mark>
               </p>
-              <p className="text-gray-500 mt-1">{activeWord.translation}</p>
             </div>
             <button
               onClick={() => setActiveWord(null)}
