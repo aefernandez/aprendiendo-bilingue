@@ -12,29 +12,37 @@ Level 3 — "Deep End": At least 9 in every 10 words must be Italian. Swap every
 
 Rules:
 - CRITICAL: Source-language segments must contain the EXACT original text, copied verbatim. Do not rephrase or alter source-language text.
-- Swap at the phrase level, not individual words. Translate meaningful chunks.
+- Decide which phrases to swap at the phrase level for grammar coherence, but emit ONE segment per word for target-language content. Each Italian word gets its own segment with its own individual English translation.
 - The mixed text must read naturally.
 - Never swap proper nouns (names of people, countries, organizations, specific places).
 - Never swap numbers or statistics.
 
 Return ONLY a JSON array of segments. Each segment has:
-- "text": the display text
+- "text": the display text (one word for target-language segments, any length for source-language segments)
 - "lang": "source" or "target"
-- "translation": if lang is "target", the original source-language phrase. If lang is "source", null.
+- "translation": if lang is "target", the English translation of that individual word. If lang is "source", null.
 
 No explanation, no preamble, no markdown. Only the JSON array.
 
 EXAMPLE — Input: "The cat sat on the mat and looked out the window." at Level 1 (at least 3 in 10 words must be Italian):
 [
-  {"text": "Il gatto", "lang": "target", "translation": "The cat"},
+  {"text": "Il", "lang": "target", "translation": "The"},
+  {"text": " ", "lang": "source", "translation": null},
+  {"text": "gatto", "lang": "target", "translation": "cat"},
   {"text": " sat on ", "lang": "source", "translation": null},
-  {"text": "il tappeto", "lang": "target", "translation": "the mat"},
+  {"text": "il", "lang": "target", "translation": "the"},
+  {"text": " ", "lang": "source", "translation": null},
+  {"text": "tappeto", "lang": "target", "translation": "mat"},
   {"text": " and ", "lang": "source", "translation": null},
-  {"text": "guardò fuori dalla", "lang": "target", "translation": "looked out the"},
+  {"text": "guardò", "lang": "target", "translation": "looked"},
+  {"text": " ", "lang": "source", "translation": null},
+  {"text": "fuori", "lang": "target", "translation": "out"},
+  {"text": " ", "lang": "source", "translation": null},
+  {"text": "dalla", "lang": "target", "translation": "from the"},
   {"text": " window.", "lang": "source", "translation": null}
 ]
 
-Note: in this example 6 of 13 words (~46%) are Italian, which exceeds the Level 1 minimum of 30%. This is correct — exceed the floor, never fall below it.`;
+Note: 7 of 14 words (~50%) are Italian, exceeding the Level 1 minimum of 30%. This is correct — exceed the floor, never fall below it.`;
 
 function extractJSON(raw: string): string {
   // Strip thinking tags (Qwen3 and similar models)

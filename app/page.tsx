@@ -10,19 +10,8 @@ const LEVELS: { value: Level; label: string; description: string }[] = [
 ];
 
 interface ActiveWord {
-  text: string;       // the individual word tapped
-  phraseText: string; // the full Italian phrase it belongs to
+  text: string;
   translation: string;
-}
-
-// Split a target-language segment into individual tappable words,
-// preserving punctuation as non-tappable trailing characters.
-function tokenize(segment: Segment): { word: string; punct: string }[] {
-  return segment.text.split(/\s+/).filter(Boolean).map((token) => {
-    const match = token.match(/^([\p{L}\p{M}'-]+)([\p{P}\p{S}]*)$/u);
-    if (match) return { word: match[1], punct: match[2] };
-    return { word: token, punct: '' };
-  });
 }
 
 export default function Home() {
@@ -132,40 +121,29 @@ export default function Home() {
           </div>
 
           <p className="text-lg leading-relaxed text-gray-900">
-            {segments.map((segment, segIndex) => {
-              if (segment.lang === 'source') {
-                return <span key={segIndex}>{segment.text}</span>;
-              }
-
-              // Target segment: render each word as individually tappable
-              const tokens = tokenize(segment);
-              return (
-                <span key={segIndex}>
-                  {tokens.map(({ word, punct }, tokenIndex) => (
-                    <span key={tokenIndex}>
-                      <button
-                        onClick={() =>
-                          setActiveWord(
-                            activeWord?.text === word
-                              ? null
-                              : { text: word, phraseText: segment.text, translation: segment.translation ?? '' }
-                          )
-                        }
-                        className={`inline rounded px-0.5 -mx-0.5 transition-colors ${
-                          activeWord?.text === word
-                            ? 'bg-amber-500 text-white'
-                            : 'bg-amber-100 text-amber-900 hover:bg-amber-200'
-                        }`}
-                      >
-                        {word}
-                      </button>
-                      {punct}
-                      {tokenIndex < tokens.length - 1 ? ' ' : ''}
-                    </span>
-                  ))}
-                </span>
-              );
-            })}
+            {segments.map((segment, segIndex) =>
+              segment.lang === 'source' ? (
+                <span key={segIndex}>{segment.text}</span>
+              ) : (
+                <button
+                  key={segIndex}
+                  onClick={() =>
+                    setActiveWord(
+                      activeWord?.text === segment.text
+                        ? null
+                        : { text: segment.text, translation: segment.translation ?? '' }
+                    )
+                  }
+                  className={`inline rounded px-0.5 -mx-0.5 transition-colors ${
+                    activeWord?.text === segment.text
+                      ? 'bg-amber-500 text-white'
+                      : 'bg-amber-100 text-amber-900 hover:bg-amber-200'
+                  }`}
+                >
+                  {segment.text}
+                </button>
+              )
+            )}
           </p>
         </div>
       )}
@@ -176,7 +154,7 @@ export default function Home() {
           <div className="max-w-2xl mx-auto flex items-start justify-between">
             <div>
               <p className="text-sm text-gray-400 mb-1">{activeWord.text}</p>
-              <p className="text-xl font-semibold text-gray-900">
+              <p className="text-xl font-semibold">
                 <mark className="bg-amber-200 text-gray-900 rounded px-1">{activeWord.translation}</mark>
               </p>
             </div>
