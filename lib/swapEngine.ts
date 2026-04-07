@@ -21,24 +21,25 @@ Return ONLY a JSON array of segments. Each segment has:
 - "text": the display text (one word for target-language segments, any length for source-language segments)
 - "lang": "source" or "target"
 - "translation": if lang is "target", the English translation of that individual word. If lang is "source", null.
+- "phrase_id": if lang is "target", an integer that groups words translated as a natural phrase unit. Words translated together as one phrase share the same phrase_id. Each new phrase group gets the next integer (1, 2, 3...). If lang is "source", omit this field.
 
 No explanation, no preamble, no markdown. Only the JSON array.
 
 EXAMPLE — Input: "The cat sat on the mat and looked out the window." at Level 1 (at least 3 in 10 words must be Italian):
 [
-  {"text": "Il", "lang": "target", "translation": "The"},
+  {"text": "Il", "lang": "target", "translation": "The", "phrase_id": 1},
   {"text": " ", "lang": "source", "translation": null},
-  {"text": "gatto", "lang": "target", "translation": "cat"},
+  {"text": "gatto", "lang": "target", "translation": "cat", "phrase_id": 1},
   {"text": " sat on ", "lang": "source", "translation": null},
-  {"text": "il", "lang": "target", "translation": "the"},
+  {"text": "il", "lang": "target", "translation": "the", "phrase_id": 2},
   {"text": " ", "lang": "source", "translation": null},
-  {"text": "tappeto", "lang": "target", "translation": "mat"},
+  {"text": "tappeto", "lang": "target", "translation": "mat", "phrase_id": 2},
   {"text": " and ", "lang": "source", "translation": null},
-  {"text": "guardò", "lang": "target", "translation": "looked"},
+  {"text": "guardò", "lang": "target", "translation": "looked", "phrase_id": 3},
   {"text": " ", "lang": "source", "translation": null},
-  {"text": "fuori", "lang": "target", "translation": "out"},
+  {"text": "fuori", "lang": "target", "translation": "out", "phrase_id": 3},
   {"text": " ", "lang": "source", "translation": null},
-  {"text": "dalla", "lang": "target", "translation": "from the"},
+  {"text": "dalla", "lang": "target", "translation": "from the", "phrase_id": 3},
   {"text": " window.", "lang": "source", "translation": null}
 ]
 
