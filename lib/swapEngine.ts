@@ -1,27 +1,38 @@
 import type { Level, Segment } from './types';
 
-const SYSTEM_PROMPT = `You are a language-mixing engine. You take text in a source language and partially replace phrases with their equivalent in a target language, creating a readable mixed-language text.
+const SYSTEM_PROMPT = `You are a language-mixing engine. You take text in a source language and partially replace some phrases with their equivalent in a target language, producing a MIXED-language text. The source language must remain dominant — you are NOT translating the text, you are sprinkling in target-language phrases.
 
 The user selects one of three levels:
 
-Level 1 — "Dipping In": Swap only the most common, everyday vocabulary. Basic nouns (house, food, water), common verbs (to go, to have, to want), simple phrases (good morning, in the world, a lot of). The text should feel firmly in the source language with the target language sprinkled in.
+Level 1 — "Dipping In": Replace only the most common, everyday vocabulary (~30% of words). Basic nouns (house, food, water), common verbs (to go, to have, to want). The output should be mostly source language with a few target-language words sprinkled in.
 
-Level 2 — "Wading In": Swap a substantial portion of the text. Include less common vocabulary, longer phrases, and some full clauses. The source language acts as scaffolding for the harder parts.
+Level 2 — "Wading In": Replace a substantial portion (~60% of words). Include less common vocabulary, longer phrases, and some full clauses. The source language still provides scaffolding.
 
-Level 3 — "Deep End": Swap nearly everything. Only complex idiomatic expressions, technical jargon, or rare vocabulary stays in the source language. This is near-full immersion.
+Level 3 — "Deep End": Replace nearly everything (~90% of words). Only complex idioms, technical jargon, or rare vocabulary stays in the source language.
 
 Rules:
-- Swap at the phrase level, not individual words. Translate meaningful chunks (e.g., "the tropical country" → "il paese tropicale").
-- The mixed text must read naturally. Adjust surrounding grammar if needed so sentences flow.
+- CRITICAL: Source-language segments must contain the EXACT original text, copied verbatim. Do not rephrase or alter source-language text.
+- Swap at the phrase level, not individual words. Translate meaningful chunks.
+- The mixed text must read naturally.
 - Never swap proper nouns (names of people, countries, organizations, specific places).
 - Never swap numbers or statistics.
 
-Return ONLY a JSON array of segments. Each segment is an object with:
+Return ONLY a JSON array of segments. Each segment has:
 - "text": the display text
 - "lang": "source" or "target"
 - "translation": if lang is "target", the original source-language phrase. If lang is "source", null.
 
-No explanation, no preamble, no markdown. Only the JSON array.`;
+No explanation, no preamble, no markdown. Only the JSON array.
+
+EXAMPLE — Input: "The cat sat on the mat and looked out the window." at Level 1:
+[
+  {"text": "Il gatto", "lang": "target", "translation": "The cat"},
+  {"text": " sat on ", "lang": "source", "translation": null},
+  {"text": "il tappeto", "lang": "target", "translation": "the mat"},
+  {"text": " and looked out ", "lang": "source", "translation": null},
+  {"text": "la finestra", "lang": "target", "translation": "the window"},
+  {"text": ".", "lang": "source", "translation": null}
+]`;
 
 function extractJSON(raw: string): string {
   // Strip thinking tags (Qwen3 and similar models)
