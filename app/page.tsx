@@ -10,7 +10,8 @@ const LEVELS: { value: Level; label: string; description: string }[] = [
 ];
 
 interface ActiveWord {
-  text: string;
+  text: string;       // the individual word tapped
+  phraseText: string; // the full Italian phrase it belongs to
   translation: string;
 }
 
@@ -147,7 +148,7 @@ export default function Home() {
                           setActiveWord(
                             activeWord?.text === word
                               ? null
-                              : { text: word, translation: segment.translation ?? '' }
+                              : { text: word, phraseText: segment.text, translation: segment.translation ?? '' }
                           )
                         }
                         className={`inline rounded px-0.5 -mx-0.5 transition-colors ${
@@ -174,7 +175,14 @@ export default function Home() {
         <div className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 shadow-xl p-6">
           <div className="max-w-2xl mx-auto flex items-start justify-between">
             <div>
-              <p className="text-xl font-semibold text-gray-900">{activeWord.text}</p>
+              {/* Full Italian phrase with tapped word highlighted */}
+              <p className="text-xl font-semibold text-gray-900">
+                {activeWord.phraseText.split(new RegExp(`(${activeWord.text})`, 'i')).map((part, i) =>
+                  part.toLowerCase() === activeWord.text.toLowerCase()
+                    ? <mark key={i} className="bg-amber-300 text-gray-900 rounded px-0.5">{part}</mark>
+                    : <span key={i}>{part}</span>
+                )}
+              </p>
               <p className="text-gray-500 mt-1">{activeWord.translation}</p>
             </div>
             <button

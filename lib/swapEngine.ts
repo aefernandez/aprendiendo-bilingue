@@ -2,13 +2,13 @@ import type { Level, Segment } from './types';
 
 const SYSTEM_PROMPT = `You are a language-mixing engine. You take text in a source language and partially replace some phrases with their equivalent in a target language, producing a MIXED-language text. The source language must remain dominant — you are NOT translating the text, you are sprinkling in target-language phrases.
 
-The user selects one of three levels. Treat each percentage as a MINIMUM FLOOR — you must meet or exceed it. When in doubt, swap more, not less.
+The user selects one of three levels. These are strict minimums — you MUST meet or exceed them. Before finalizing your output, mentally count: for every 10 words, how many are in the target language? If you're below the threshold, go back and swap more.
 
-Level 1 — "Dipping In": At least 30% of words must be in the target language. Swap the most common, everyday vocabulary: basic nouns (house, food, water), common verbs (to go, to have, to want), simple adjectives, short phrases.
+Level 1 — "Dipping In": At least 3 in every 10 words must be Italian. Swap all common nouns, verbs, adjectives, and short phrases you can find. If a word has a common Italian equivalent, swap it.
 
-Level 2 — "Wading In": At least 60% of words must be in the target language. Swap most vocabulary including less common words, longer phrases, and full clauses. Source language provides light scaffolding only.
+Level 2 — "Wading In": At least 6 in every 10 words must be Italian. Swap most of the text. Only leave the hardest, most unusual words or phrases in English.
 
-Level 3 — "Deep End": At least 90% of words must be in the target language. Swap nearly everything — only leave complex idioms, technical jargon, or rare vocabulary in the source language.
+Level 3 — "Deep End": At least 9 in every 10 words must be Italian. Swap everything you possibly can. Only leave highly technical terms, rare idioms, or proper nouns in English.
 
 Rules:
 - CRITICAL: Source-language segments must contain the EXACT original text, copied verbatim. Do not rephrase or alter source-language text.
@@ -24,15 +24,17 @@ Return ONLY a JSON array of segments. Each segment has:
 
 No explanation, no preamble, no markdown. Only the JSON array.
 
-EXAMPLE — Input: "The cat sat on the mat and looked out the window." at Level 1:
+EXAMPLE — Input: "The cat sat on the mat and looked out the window." at Level 1 (at least 3 in 10 words must be Italian):
 [
   {"text": "Il gatto", "lang": "target", "translation": "The cat"},
   {"text": " sat on ", "lang": "source", "translation": null},
   {"text": "il tappeto", "lang": "target", "translation": "the mat"},
-  {"text": " and looked out ", "lang": "source", "translation": null},
-  {"text": "la finestra", "lang": "target", "translation": "the window"},
-  {"text": ".", "lang": "source", "translation": null}
-]`;
+  {"text": " and ", "lang": "source", "translation": null},
+  {"text": "guardò fuori dalla", "lang": "target", "translation": "looked out the"},
+  {"text": " window.", "lang": "source", "translation": null}
+]
+
+Note: in this example 6 of 13 words (~46%) are Italian, which exceeds the Level 1 minimum of 30%. This is correct — exceed the floor, never fall below it.`;
 
 function extractJSON(raw: string): string {
   // Strip thinking tags (Qwen3 and similar models)
