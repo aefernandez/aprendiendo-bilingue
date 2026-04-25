@@ -17,7 +17,7 @@ export function expandToWords(segments: Segment[]): Word[] {
 
     return [...segmenter.segment(segment.text)].map(({ segment: text, isWordLike }) => ({
       text,
-      isWordLike,
+      isWordLike: isWordLike ?? false,
       lang: 'target' as const,
       phraseIndex,
       phraseText: segment.text,
