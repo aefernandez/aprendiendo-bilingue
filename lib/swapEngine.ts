@@ -94,7 +94,13 @@ export async function swap(text: string, level: Level): Promise<Segment[]> {
     return fallback(text);
   }
 
-  const spans = selectSpans(text, level);
+  let spans: ReturnType<typeof selectSpans>;
+  try {
+    spans = selectSpans(text, level);
+  } catch (err) {
+    console.error('Tagger error:', err);
+    return fallback(text);
+  }
   if (spans.length === 0) return fallback(text);
 
   try {
