@@ -1,49 +1,52 @@
 import type { Level, Segment } from './types';
 
-const SYSTEM_PROMPT = `You are a language-mixing engine. You take text in a source language and partially replace some phrases with their equivalent in a target language, producing a MIXED-language text. The source language must remain dominant — you are NOT translating the text, you are sprinkling in target-language phrases.
+const SYSTEM_PROMPT = `You are a language-mixing engine. You rewrite English text so that a target percentage of words are replaced with Italian equivalents. The level determines the percentage — it is a hard minimum, not a suggestion.
 
-The user selects one of three levels. These are strict minimums — you MUST meet or exceed them. Before finalizing your output, mentally count: for every 10 words, how many are in the target language? If you're below the threshold, go back and swap more.
+Level 1 — "Dipping In": At least 30% of all words must be Italian.
+Level 2 — "Wading In": At least 60% of all words must be Italian.
+Level 3 — "Deep End": At least 90% of all words must be Italian.
 
-Level 1 — "Dipping In": At least 3 in every 10 words must be Italian. Swap all common nouns, verbs, adjectives, and short phrases you can find. If a word has a common Italian equivalent, swap it.
+BEFORE producing your output, plan which words to swap:
+- Start by swapping ALL nouns, verbs, adjectives, and adverbs you can find.
+- If still below target, swap articles, prepositions, and connectors too.
+- Only STOP swapping when you've reached the minimum. When in doubt, swap more.
+- Never swap: proper nouns (people, countries, places, organizations), numbers, statistics.
 
-Level 2 — "Wading In": At least 6 in every 10 words must be Italian. Swap most of the text. Only leave the hardest, most unusual words or phrases in English.
+Produce ONE segment per Italian word. Group words that form a natural phrase unit under the same phrase_id.
 
-Level 3 — "Deep End": At least 9 in every 10 words must be Italian. Swap everything you possibly can. Only leave highly technical terms, rare idioms, or proper nouns in English.
-
-Rules:
-- CRITICAL: Source-language segments must contain the EXACT original text, copied verbatim. Do not rephrase or alter source-language text.
-- Decide which phrases to swap at the phrase level for grammar coherence, but emit ONE segment per word for target-language content. Each Italian word gets its own segment with its own individual English translation.
-- The mixed text must read naturally.
-- Never swap proper nouns (names of people, countries, organizations, specific places).
-- Never swap numbers or statistics.
-
-Return ONLY a JSON array of segments. Each segment has:
-- "text": the display text (one word for target-language segments, any length for source-language segments)
+Return ONLY a JSON array. Each element:
+- "text": display text — one word for target-language segments, any span for source
 - "lang": "source" or "target"
-- "translation": if lang is "target", the English translation of that individual word. If lang is "source", null.
-- "phrase_id": if lang is "target", an integer that groups words translated as a natural phrase unit. Words translated together as one phrase share the same phrase_id. Each new phrase group gets the next integer (1, 2, 3...). If lang is "source", omit this field.
+- "translation": for target segments, the English meaning of that word; for source, null
+- "phrase_id": for target segments only, an integer grouping phrase-unit words (1, 2, 3…); omit for source
 
-No explanation, no preamble, no markdown. Only the JSON array.
+No explanation, preamble, or markdown. Only the JSON array.
 
-EXAMPLE — Input: "The cat sat on the mat and looked out the window." at Level 1 (at least 3 in 10 words must be Italian):
+EXAMPLE — "The cat sat on the mat and looked out the window." at Level 2 (at least 60% Italian):
 [
   {"text": "Il", "lang": "target", "translation": "The", "phrase_id": 1},
   {"text": " ", "lang": "source", "translation": null},
   {"text": "gatto", "lang": "target", "translation": "cat", "phrase_id": 1},
-  {"text": " sat on ", "lang": "source", "translation": null},
-  {"text": "il", "lang": "target", "translation": "the", "phrase_id": 2},
+  {"text": " ", "lang": "source", "translation": null},
+  {"text": "era", "lang": "target", "translation": "was", "phrase_id": 2},
+  {"text": " ", "lang": "source", "translation": null},
+  {"text": "seduto", "lang": "target", "translation": "sitting", "phrase_id": 2},
+  {"text": " ", "lang": "source", "translation": null},
+  {"text": "sul", "lang": "target", "translation": "on the", "phrase_id": 2},
   {"text": " ", "lang": "source", "translation": null},
   {"text": "tappeto", "lang": "target", "translation": "mat", "phrase_id": 2},
   {"text": " and ", "lang": "source", "translation": null},
-  {"text": "guardò", "lang": "target", "translation": "looked", "phrase_id": 3},
+  {"text": "guardava", "lang": "target", "translation": "looked", "phrase_id": 3},
   {"text": " ", "lang": "source", "translation": null},
   {"text": "fuori", "lang": "target", "translation": "out", "phrase_id": 3},
   {"text": " ", "lang": "source", "translation": null},
   {"text": "dalla", "lang": "target", "translation": "from the", "phrase_id": 3},
-  {"text": " window.", "lang": "source", "translation": null}
+  {"text": " ", "lang": "source", "translation": null},
+  {"text": "finestra", "lang": "target", "translation": "window", "phrase_id": 3},
+  {"text": ".", "lang": "source", "translation": null}
 ]
 
-Note: 7 of 14 words (~50%) are Italian, exceeding the Level 1 minimum of 30%. This is correct — exceed the floor, never fall below it.`;
+Tally: 11 Italian words out of 14 total = 79%. This satisfies the Level 2 minimum of 60%.`;
 
 function extractJSON(raw: string): string {
   // Strip thinking tags (Qwen3 and similar models)
