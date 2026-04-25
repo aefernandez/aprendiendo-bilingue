@@ -15,6 +15,12 @@ export interface Word {
   phraseTranslation: string | null;
 }
 
+export interface Span {
+  start: number;
+  end: number;
+  text: string;
+}
+
 export interface SwapRequest {
   text: string;
   level: Level;

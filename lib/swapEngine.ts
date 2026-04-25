@@ -1,53 +1,87 @@
-import type { Level, Segment } from './types';
+import type { Level, Segment, Span } from './types';
+import { selectSpans } from './tagger';
+import { reconstructSegments } from './segmenter';
 
-const SYSTEM_PROMPT = `You are a language-mixing engine. You take English text and replace portions of it with Italian phrases, producing a mixed-language text. You swap at the phrase level — translate meaningful chunks together so the Italian reads naturally.
+const SYSTEM_PROMPT = `You are a translation engine. Translate English phrases to Italian.
+Use the full text provided for grammatical context — ensure correct tense, gender, and number agreement.
+Return ONLY a JSON array of translations. The array must have exactly as many items as numbered phrases.
+No explanation, preamble, or markdown. Only the JSON array.`;
 
-The level controls how much gets swapped:
+function buildUserMessage(text: string, spans: Span[]): string {
+  const phraseList = spans.map((s, i) => `${i + 1}. ${s.text}`).join('\n');
+  return `Full text: ${text}
 
-Level 1 — "Dipping In": 25–40% of words in Italian. Common nouns, basic verbs, simple adjectives. English is dominant.
-Level 2 — "Wading In": 55–70% of words in Italian. Most content words and phrases. English provides scaffolding for the harder parts.
-Level 3 — "Deep End": 85–95% of words in Italian. Nearly everything. Only rare idioms, technical jargon, and proper nouns stay in English.
+Translate each phrase to Italian:
+${phraseList}
 
-Rules:
-- Swap meaningful phrase chunks together (e.g. "the red car" → "la macchina rossa"), not word by word.
-- The mixed text must read naturally. Adjust surrounding English grammar if needed.
-- Source segments must contain the EXACT original English text, verbatim.
-- Never swap proper nouns (people, countries, places, organizations) or numbers.
+Return a JSON array with exactly ${spans.length} translations: ["it1","it2",...]`;
+}
 
-Return ONLY a JSON array. Each element:
-- "text": the display text — a full Italian phrase for target segments, any English span for source segments
-- "lang": "source" or "target"
-- "translation": for target segments, the English meaning of the full phrase; for source, null
+function buildRetryMessage(spans: Span[]): string {
+  const phraseList = spans.map((s, i) => `${i + 1}. "${s.text}"`).join('\n');
+  return `Translate each phrase from English to Italian.
+You MUST return exactly ${spans.length} translations — one per numbered phrase.
 
-No explanation, preamble, or markdown. Only the JSON array.
+${phraseList}
 
-EXAMPLE — "The cat sat on the mat and looked out the window." at Level 2 (55–70% Italian):
-[
-  {"text": "Il gatto", "lang": "target", "translation": "The cat"},
-  {"text": " sat on ", "lang": "source", "translation": null},
-  {"text": "il tappeto", "lang": "target", "translation": "the mat"},
-  {"text": " and ", "lang": "source", "translation": null},
-  {"text": "guardava fuori dalla finestra", "lang": "target", "translation": "looked out the window"}
-]
-
-Tally: 8 Italian words out of 14 total = 57%. Satisfies the Level 2 range of 55–70%.`;
+Return ONLY: ["translation1","translation2",...] with exactly ${spans.length} items.`;
+}
 
 function extractJSON(raw: string): string {
-  // Strip thinking tags (Qwen3 and similar models)
   const text = raw.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
-
   const start = text.indexOf('[');
   const end = text.lastIndexOf(']');
-
-  if (start === -1 || end === -1) {
-    throw new Error('No JSON array found in model response');
-  }
-
+  if (start === -1 || end === -1) throw new Error('No JSON array found');
   return text.slice(start, end + 1);
 }
 
 function fallback(text: string): Segment[] {
   return [{ text, lang: 'source', translation: null }];
+}
+
+async function callModel(
+  baseUrl: string,
+  apiKey: string,
+  model: string,
+  userMessage: string,
+): Promise<string[] | null> {
+  const response = await fetch(`${baseUrl}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+      'HTTP-Referer': 'https://aprendiendo-bilingue.vercel.app',
+      'X-Title': 'Aprendiendo Bilingue',
+    },
+    body: JSON.stringify({
+      model,
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: userMessage },
+      ],
+      temperature: 0,
+      max_tokens: 8192,
+    }),
+  });
+
+  if (!response.ok) {
+    console.error('OpenRouter error:', response.status, await response.text());
+    return null;
+  }
+
+  const data = await response.json();
+  const content: string | undefined = data.choices?.[0]?.message?.content;
+  if (!content) return null;
+
+  try {
+    const parsed = JSON.parse(extractJSON(content));
+    if (Array.isArray(parsed) && parsed.every(item => typeof item === 'string')) {
+      return parsed as string[];
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 export async function swap(text: string, level: Level): Promise<Segment[]> {
@@ -60,53 +94,25 @@ export async function swap(text: string, level: Level): Promise<Segment[]> {
     return fallback(text);
   }
 
-  const userMessage = `Source language: English
-Target language: Italian
-Level: ${level}
-
-Text:
-${text}`;
+  const spans = selectSpans(text, level);
+  if (spans.length === 0) return fallback(text);
 
   try {
-    const response = await fetch(`${baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-        'HTTP-Referer': 'https://aprendiendo-bilingue.vercel.app',
-        'X-Title': 'Aprendiendo Bilingue',
-      },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: userMessage },
-        ],
-        temperature: 0.7,
-        max_tokens: 8192,
-      }),
-    });
+    // First attempt: full context + numbered list
+    let translations = await callModel(baseUrl, apiKey, model, buildUserMessage(text, spans));
 
-    if (!response.ok) {
-      console.error('OpenRouter error:', response.status, await response.text());
+    // Retry with context-free prompt if count mismatches
+    if (!translations || translations.length !== spans.length) {
+      console.warn(`Count mismatch (got ${translations?.length ?? 0}, expected ${spans.length}). Retrying.`);
+      translations = await callModel(baseUrl, apiKey, model, buildRetryMessage(spans));
+    }
+
+    if (!translations || translations.length !== spans.length) {
+      console.error('Translation count mismatch after retry — returning original text');
       return fallback(text);
     }
 
-    const data = await response.json();
-    const content: string | undefined = data.choices?.[0]?.message?.content;
-
-    if (!content) {
-      console.error('Empty content in OpenRouter response');
-      return fallback(text);
-    }
-
-    const segments = JSON.parse(extractJSON(content)) as Segment[];
-
-    if (!Array.isArray(segments) || segments.length === 0) {
-      return fallback(text);
-    }
-
-    return segments;
+    return reconstructSegments(text, spans, translations);
   } catch (err) {
     console.error('Swap engine error:', err);
     return fallback(text);
