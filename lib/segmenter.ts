@@ -3,7 +3,7 @@ import type { Segment, Word } from './types';
 const segmenter = new Intl.Segmenter('it', { granularity: 'word' });
 
 export function expandToWords(segments: Segment[]): Word[] {
-  return segments.flatMap((segment, phraseIndex) => {
+  return segments.flatMap((segment, phraseIndex): Word[] => {
     if (segment.lang === 'source') {
       return [{
         text: segment.text,
