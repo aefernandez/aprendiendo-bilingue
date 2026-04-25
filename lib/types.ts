@@ -4,7 +4,15 @@ export interface Segment {
   text: string;
   lang: 'source' | 'target';
   translation: string | null;
-  phrase_id?: number; // groups words translated as a unit; null/absent for source segments
+}
+
+export interface Word {
+  text: string;
+  isWordLike: boolean;
+  lang: 'source' | 'target';
+  phraseIndex: number;
+  phraseText: string;
+  phraseTranslation: string | null;
 }
 
 export interface SwapRequest {

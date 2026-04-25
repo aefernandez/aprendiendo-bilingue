@@ -1,7 +1,8 @@
 'use client';
 
 import { useState } from 'react';
-import type { Segment, Level } from '@/lib/types';
+import type { Word, Level } from '@/lib/types';
+import { expandToWords } from '@/lib/segmenter';
 
 const LEVELS: { value: Level; label: string; description: string }[] = [
   { value: 1, label: 'Dipping In', description: '~30% Italian' },
@@ -9,26 +10,21 @@ const LEVELS: { value: Level; label: string; description: string }[] = [
   { value: 3, label: 'Deep End', description: '~90% Italian' },
 ];
 
-interface ActiveWord {
-  text: string;
-  translation: string;
-}
-
 export default function Home() {
   const [inputText, setInputText] = useState('');
   const [level, setLevel] = useState<Level>(1);
-  const [segments, setSegments] = useState<Segment[] | null>(null);
+  const [words, setWords] = useState<Word[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [activeWord, setActiveWord] = useState<ActiveWord | null>(null);
+  const [activePhraseIndex, setActivePhraseIndex] = useState<number | null>(null);
 
   async function handleSubmit() {
     if (!inputText.trim()) return;
 
     setLoading(true);
     setError(null);
-    setSegments(null);
-    setActiveWord(null);
+    setWords(null);
+    setActivePhraseIndex(null);
 
     try {
       const response = await fetch('/api/swap', {
@@ -40,13 +36,17 @@ export default function Home() {
       if (!response.ok) throw new Error('Request failed');
 
       const data = await response.json();
-      setSegments(data.segments);
+      setWords(expandToWords(data.segments));
     } catch {
       setError('Something went wrong. Please try again.');
     } finally {
       setLoading(false);
     }
   }
+
+  const activePhrase = activePhraseIndex !== null
+    ? words?.find(w => w.phraseIndex === activePhraseIndex && w.lang === 'target') ?? null
+    : null;
 
   return (
     <main className="min-h-screen max-w-2xl mx-auto px-4 py-8">
@@ -56,7 +56,7 @@ export default function Home() {
       </header>
 
       {/* Input view */}
-      {!segments && !loading && (
+      {!words && !loading && (
         <div className="space-y-6">
           <textarea
             value={inputText}
@@ -108,12 +108,12 @@ export default function Home() {
       )}
 
       {/* Reader view */}
-      {segments && (
+      {words && (
         <div className="pb-40">
           <div className="flex items-center justify-between mb-6">
             <p className="text-sm text-gray-400">Tap any Italian word to see its meaning</p>
             <button
-              onClick={() => { setSegments(null); setActiveWord(null); }}
+              onClick={() => { setWords(null); setActivePhraseIndex(null); }}
               className="text-sm text-amber-500 hover:text-amber-600 font-medium"
             >
               ← New text
@@ -121,45 +121,57 @@ export default function Home() {
           </div>
 
           <p className="text-lg leading-relaxed text-gray-900">
-            {segments.map((segment, segIndex) =>
-              segment.lang === 'source' ? (
-                <span key={segIndex}>{segment.text}</span>
-              ) : (
+            {words.map((word, i) => {
+              if (word.lang === 'source') {
+                return <span key={i}>{word.text}</span>;
+              }
+
+              const isActive = word.phraseIndex === activePhraseIndex;
+
+              if (!word.isWordLike) {
+                // Space or punctuation inside an Italian phrase — highlight passively, no click
+                return (
+                  <span
+                    key={i}
+                    className={isActive ? 'bg-amber-500 text-white' : 'bg-amber-100 text-amber-900'}
+                  >
+                    {word.text}
+                  </span>
+                );
+              }
+
+              return (
                 <button
-                  key={segIndex}
+                  key={i}
                   onClick={() =>
-                    setActiveWord(
-                      activeWord?.text === segment.text
-                        ? null
-                        : { text: segment.text, translation: segment.translation ?? '' }
-                    )
+                    setActivePhraseIndex(isActive ? null : word.phraseIndex)
                   }
                   className={`inline rounded px-0.5 -mx-0.5 transition-colors ${
-                    activeWord?.text === segment.text
+                    isActive
                       ? 'bg-amber-500 text-white'
                       : 'bg-amber-100 text-amber-900 hover:bg-amber-200'
                   }`}
                 >
-                  {segment.text}
+                  {word.text}
                 </button>
-              )
-            )}
+              );
+            })}
           </p>
         </div>
       )}
 
       {/* Definition card */}
-      {activeWord && (
+      {activePhrase && (
         <div className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 shadow-xl p-6">
           <div className="max-w-2xl mx-auto flex items-start justify-between">
             <div>
-              <p className="text-sm text-gray-400 mb-1">{activeWord.text}</p>
+              <p className="text-sm text-gray-400 mb-1">{activePhrase.phraseText}</p>
               <p className="text-xl font-semibold">
-                <mark className="bg-amber-200 text-gray-900 rounded px-1">{activeWord.translation}</mark>
+                <mark className="bg-amber-200 text-gray-900 rounded px-1">{activePhrase.phraseTranslation}</mark>
               </p>
             </div>
             <button
-              onClick={() => setActiveWord(null)}
+              onClick={() => setActivePhraseIndex(null)}
               className="text-gray-400 hover:text-gray-600 text-2xl leading-none ml-6 mt-0.5"
               aria-label="Close"
             >
