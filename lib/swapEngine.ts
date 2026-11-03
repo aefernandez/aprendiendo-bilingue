@@ -1,39 +1,130 @@
 import type { Level, Span, SwapResult } from './types';
 import { selectSpans } from './tagger';
 import { reconstructSegments } from './segmenter';
+import { loadLlmConfig, missingKey, type LlmConfig } from './llmConfig';
+
+// ---------------------------------------------------------------------------
+// Prompts
+// ---------------------------------------------------------------------------
 
 const SYSTEM_PROMPT = `You are a translation engine. Translate English phrases to Italian.
-Use the full text provided for grammatical context — ensure correct tense, gender, and number agreement.
-Return ONLY a JSON array of translations. The array must have exactly as many items as numbered phrases.
-No explanation, preamble, or markdown. Only the JSON array.`;
+Each phrase is taken from the full text and its translation will replace it in place, so use the full text for grammatical context — ensure correct tense, gender, and number agreement.
+Return ONLY a JSON object of the form {"translations":[{"i":1,"t":"..."},{"i":2,"t":"..."}]}: one item per numbered phrase, in order, where "i" is the phrase number and "t" is its Italian translation. Never put the number inside "t".
+No explanation, preamble, or markdown. Only the JSON object.`;
+
+function phraseList(spans: Span[]): string {
+  return spans.map((s, i) => `${i + 1}. ${s.text}`).join('\n');
+}
 
 function buildUserMessage(text: string, spans: Span[]): string {
-  const phraseList = spans.map((s, i) => `${i + 1}. ${s.text}`).join('\n');
   return `Full text: ${text}
 
 Translate each phrase to Italian:
-${phraseList}
+${phraseList(spans)}
 
-Return a JSON array with exactly ${spans.length} translations: ["it1","it2",...]`;
+Return {"translations":[...]} with exactly ${spans.length} items, numbered 1 to ${spans.length}.`;
 }
 
-function buildRetryMessage(spans: Span[]): string {
-  const phraseList = spans.map((s, i) => `${i + 1}. "${s.text}"`).join('\n');
-  return `Translate each phrase from English to Italian.
-You MUST return exactly ${spans.length} translations — one per numbered phrase.
+// The retry keeps the full text: without it the model can't resolve gender,
+// number or tense, which is exactly what tends to go wrong the first time.
+function buildRetryMessage(text: string, spans: Span[]): string {
+  return `${buildUserMessage(text, spans)}
 
-${phraseList}
-
-Return ONLY: ["translation1","translation2",...] with exactly ${spans.length} items.`;
+Your previous answer was not valid. You MUST return exactly ${spans.length} items, one per numbered phrase, with "i" from 1 to ${spans.length} and a non-empty "t" for each.`;
 }
 
-function extractJSON(raw: string): string {
-  const text = raw.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
-  const start = text.indexOf('[');
-  const end = text.lastIndexOf(']');
-  if (start === -1 || end === -1) throw new Error('No JSON array found');
-  return text.slice(start, end + 1);
+const RESPONSE_FORMAT = {
+  type: 'json_schema',
+  json_schema: {
+    name: 'translations',
+    strict: true,
+    schema: {
+      type: 'object',
+      properties: {
+        translations: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              i: { type: 'integer' },
+              t: { type: 'string' },
+            },
+            required: ['i', 't'],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ['translations'],
+      additionalProperties: false,
+    },
+  },
+} as const;
+
+// ---------------------------------------------------------------------------
+// Response parsing
+// ---------------------------------------------------------------------------
+
+function tryParse(raw: string): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
 }
+
+function between(text: string, open: string, close: string): string | undefined {
+  const start = text.indexOf(open);
+  const end = text.lastIndexOf(close);
+  return start !== -1 && end > start ? text.slice(start, end + 1) : undefined;
+}
+
+/**
+ * Turns the model's reply into exactly `count` translations, in phrase order,
+ * or null if the reply can't be trusted. Accepts the structured
+ * {"translations":[{"i","t"}]} shape, and a bare array of strings from
+ * backends without structured outputs.
+ */
+export function parseTranslations(content: string, count: number): string[] | null {
+  let text = content.replace(/<think>[\s\S]*?<\/think>/g, '');
+  // An unclosed thinking block means the answer was cut off.
+  if (text.includes('<think>')) return null;
+  text = text.replace(/```(?:json)?/g, '').trim();
+
+  const parsed =
+    tryParse(text) ??
+    tryParse(between(text, '{', '}') ?? '') ??
+    tryParse(between(text, '[', ']') ?? '');
+
+  const items: unknown =
+    parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as { translations?: unknown }).translations
+      : parsed;
+  if (!Array.isArray(items) || items.length !== count) return null;
+
+  const result: (string | undefined)[] = new Array(count);
+  for (let position = 0; position < items.length; position++) {
+    const item = items[position];
+    let index: unknown = position + 1;
+    let translation: unknown = item;
+    if (item && typeof item === 'object') {
+      index = (item as { i?: unknown }).i;
+      translation = (item as { t?: unknown }).t;
+    }
+    if (typeof index !== 'number' || !Number.isInteger(index) || index < 1 || index > count) return null;
+    if (result[index - 1] !== undefined) return null; // duplicate index
+    if (typeof translation !== 'string') return null;
+    // Drop a leaked list number ("3. ciao" for phrase 3).
+    const cleaned = translation.replace(new RegExp(`^\\s*${index}[.)]\\s+`), '').trim();
+    // An empty translation would silently delete source text.
+    if (!cleaned) return null;
+    result[index - 1] = cleaned;
+  }
+  return result as string[];
+}
+
+// ---------------------------------------------------------------------------
+// Backend call
+// ---------------------------------------------------------------------------
 
 // Total time budget for one swap, across the first call and any retry.
 // The spec requires results within 15 s; leave headroom for the response.
@@ -43,41 +134,57 @@ const MIN_RETRY_MS = 4_000;
 // Upstream error bodies can be large HTML pages or echo the prompt; log a slice.
 const MAX_LOGGED_BODY_CHARS = 300;
 
+// Output budget sized to the work: roughly one token per ~3 characters of
+// Italian (which runs a little longer than English), plus JSON overhead per
+// item, with generous headroom. Caps cost when a reply runs away.
+export function maxTokensFor(spans: Span[]): number {
+  const chars = spans.reduce((n, s) => n + s.text.length, 0);
+  return Math.min(8192, Math.max(512, 256 + Math.ceil(chars * 0.75) + spans.length * 16));
+}
+
 function fallback(text: string): SwapResult {
   return { segments: [{ text, lang: 'source', translation: null }], degraded: true };
 }
 
 async function callModel(
-  baseUrl: string,
-  apiKey: string,
-  model: string,
+  config: LlmConfig,
   userMessage: string,
+  spans: Span[],
   timeoutMs: number,
 ): Promise<string[] | null> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
+  if (config.isOpenRouter) {
+    headers['HTTP-Referer'] = 'https://aprendiendo-bilingue.vercel.app';
+    headers['X-Title'] = 'Aprendiendo Bilingue';
+  }
+
+  const body: Record<string, unknown> = {
+    model: config.model,
+    messages: [
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user', content: userMessage },
+    ],
+    temperature: 0,
+    max_tokens: maxTokensFor(spans),
+  };
+  if (config.structuredOutputs) {
+    body.response_format = RESPONSE_FORMAT;
+    // Only route to OpenRouter providers that actually enforce the schema.
+    if (config.isOpenRouter) body.provider = { require_parameters: true };
+  }
+
   try {
-    const response = await fetch(`${baseUrl}/chat/completions`, {
+    const response = await fetch(`${config.baseUrl}/chat/completions`, {
       method: 'POST',
       signal: AbortSignal.timeout(timeoutMs),
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-        'HTTP-Referer': 'https://aprendiendo-bilingue.vercel.app',
-        'X-Title': 'Aprendiendo Bilingue',
-      },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: userMessage },
-        ],
-        temperature: 0,
-        max_tokens: 8192,
-      }),
+      headers,
+      body: JSON.stringify(body),
     });
 
     if (!response.ok) {
-      const body = await response.text().catch(() => '');
-      console.error('LLM error:', response.status, body.slice(0, MAX_LOGGED_BODY_CHARS));
+      const errorBody = await response.text().catch(() => '');
+      console.error('LLM error:', response.status, errorBody.slice(0, MAX_LOGGED_BODY_CHARS));
       return null;
     }
 
@@ -85,11 +192,7 @@ async function callModel(
     const content: unknown = data?.choices?.[0]?.message?.content;
     if (typeof content !== 'string' || !content) return null;
 
-    const parsed = JSON.parse(extractJSON(content));
-    if (Array.isArray(parsed) && parsed.every(item => typeof item === 'string')) {
-      return parsed as string[];
-    }
-    return null;
+    return parseTranslations(content, spans.length);
   } catch (err) {
     const name = err instanceof Error ? err.name : 'Error';
     const message = err instanceof Error ? err.message : String(err);
@@ -98,8 +201,13 @@ async function callModel(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Public entry point
+// ---------------------------------------------------------------------------
+
 export interface SwapOptions {
   deadlineMs?: number;
+  config?: LlmConfig;
 }
 
 export async function swap(text: string, level: Level, options: SwapOptions = {}): Promise<SwapResult> {
@@ -107,12 +215,9 @@ export async function swap(text: string, level: Level, options: SwapOptions = {}
   const startedAt = Date.now();
   const remaining = () => deadlineMs - (Date.now() - startedAt);
 
-  const apiKey = process.env.OPENROUTER_API_KEY;
-  const model = process.env.OPENROUTER_MODEL ?? 'qwen/qwen3-8b';
-  const baseUrl = process.env.OPENROUTER_BASE_URL ?? 'https://openrouter.ai/api/v1';
-
-  if (!apiKey) {
-    console.error('OPENROUTER_API_KEY is not set — returning original text');
+  const config = options.config ?? loadLlmConfig();
+  if (missingKey(config)) {
+    console.error('LLM_API_KEY is not set — returning original text');
     return fallback(text);
   }
 
@@ -128,21 +233,19 @@ export async function swap(text: string, level: Level, options: SwapOptions = {}
     return { segments: [{ text, lang: 'source', translation: null }], degraded: false };
   }
 
-  // First attempt: full context + numbered list
-  let translations = await callModel(baseUrl, apiKey, model, buildUserMessage(text, spans), remaining());
+  let translations = await callModel(config, buildUserMessage(text, spans), spans, remaining());
 
-  // Retry with context-free prompt if count mismatches, time permitting
-  if (!translations || translations.length !== spans.length) {
+  if (!translations) {
     if (remaining() < Math.min(MIN_RETRY_MS, deadlineMs / 3)) {
       console.error('No time left to retry — returning original text');
       return fallback(text);
     }
-    console.warn(`Count mismatch (got ${translations?.length ?? 0}, expected ${spans.length}). Retrying.`);
-    translations = await callModel(baseUrl, apiKey, model, buildRetryMessage(spans), remaining());
+    console.warn(`Invalid translations for ${spans.length} phrases. Retrying.`);
+    translations = await callModel(config, buildRetryMessage(text, spans), spans, remaining());
   }
 
-  if (!translations || translations.length !== spans.length) {
-    console.error('Translation count mismatch after retry — returning original text');
+  if (!translations) {
+    console.error('Invalid translations after retry — returning original text');
     return fallback(text);
   }
 
