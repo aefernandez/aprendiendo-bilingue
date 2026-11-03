@@ -21,6 +21,14 @@ export interface Span {
   text: string;
 }
 
+export interface SwapResult {
+  segments: Segment[];
+  // True when the engine fell back to the original text (LLM slow, down, or
+  // returned something unusable). The UI should say so instead of implying
+  // the text was mixed.
+  degraded: boolean;
+}
+
 export interface SwapRequest {
   text: string;
   level: Level;

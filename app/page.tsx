@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import type { Word, Level } from '@/lib/types';
+import type { Word, Level, SwapResult } from '@/lib/types';
 import { expandToWords } from '@/lib/segmenter';
 
 const LEVELS: { value: Level; label: string; description: string }[] = [
@@ -16,6 +16,7 @@ export default function Home() {
   const [words, setWords] = useState<Word[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [degraded, setDegraded] = useState(false);
   const [activePhraseIndex, setActivePhraseIndex] = useState<number | null>(null);
 
   async function handleSubmit() {
@@ -23,6 +24,7 @@ export default function Home() {
 
     setLoading(true);
     setError(null);
+    setDegraded(false);
     setWords(null);
     setActivePhraseIndex(null);
 
@@ -33,9 +35,14 @@ export default function Home() {
         body: JSON.stringify({ text: inputText, level }),
       });
 
-      if (!response.ok) throw new Error('Request failed');
+      if (!response.ok) {
+        const body = await response.json().catch(() => null);
+        setError(typeof body?.error === 'string' ? body.error : 'Something went wrong. Please try again.');
+        return;
+      }
 
-      const data = await response.json();
+      const data = (await response.json()) as SwapResult;
+      setDegraded(data.degraded);
       setWords(expandToWords(data.segments));
     } catch {
       setError('Something went wrong. Please try again.');
@@ -119,6 +126,12 @@ export default function Home() {
               ← New text
             </button>
           </div>
+
+          {degraded && (
+            <p role="status" className="mb-6 rounded-xl bg-gray-100 px-4 py-3 text-sm text-gray-700">
+              We couldn&apos;t mix this text right now, so it&apos;s shown as-is. Please try again in a moment.
+            </p>
+          )}
 
           <p className="text-lg leading-relaxed text-gray-900">
             {words.map((word, i) => {

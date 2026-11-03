@@ -1,4 +1,4 @@
-import type { Level, Segment, Span } from './types';
+import type { Level, Span, SwapResult } from './types';
 import { selectSpans } from './tagger';
 import { reconstructSegments } from './segmenter';
 
@@ -35,8 +35,16 @@ function extractJSON(raw: string): string {
   return text.slice(start, end + 1);
 }
 
-function fallback(text: string): Segment[] {
-  return [{ text, lang: 'source', translation: null }];
+// Total time budget for one swap, across the first call and any retry.
+// The spec requires results within 15 s; leave headroom for the response.
+export const SWAP_DEADLINE_MS = 14_000;
+// Don't start a retry unless at least this much of the budget remains.
+const MIN_RETRY_MS = 4_000;
+// Upstream error bodies can be large HTML pages or echo the prompt; log a slice.
+const MAX_LOGGED_BODY_CHARS = 300;
+
+function fallback(text: string): SwapResult {
+  return { segments: [{ text, lang: 'source', translation: null }], degraded: true };
 }
 
 async function callModel(
@@ -44,47 +52,61 @@ async function callModel(
   apiKey: string,
   model: string,
   userMessage: string,
+  timeoutMs: number,
 ): Promise<string[] | null> {
-  const response = await fetch(`${baseUrl}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
-      'HTTP-Referer': 'https://aprendiendo-bilingue.vercel.app',
-      'X-Title': 'Aprendiendo Bilingue',
-    },
-    body: JSON.stringify({
-      model,
-      messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
-        { role: 'user', content: userMessage },
-      ],
-      temperature: 0,
-      max_tokens: 8192,
-    }),
-  });
-
-  if (!response.ok) {
-    console.error('OpenRouter error:', response.status, await response.text());
-    return null;
-  }
-
-  const data = await response.json();
-  const content: string | undefined = data.choices?.[0]?.message?.content;
-  if (!content) return null;
-
   try {
+    const response = await fetch(`${baseUrl}/chat/completions`, {
+      method: 'POST',
+      signal: AbortSignal.timeout(timeoutMs),
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+        'HTTP-Referer': 'https://aprendiendo-bilingue.vercel.app',
+        'X-Title': 'Aprendiendo Bilingue',
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: 'system', content: SYSTEM_PROMPT },
+          { role: 'user', content: userMessage },
+        ],
+        temperature: 0,
+        max_tokens: 8192,
+      }),
+    });
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+      console.error('LLM error:', response.status, body.slice(0, MAX_LOGGED_BODY_CHARS));
+      return null;
+    }
+
+    const data = await response.json();
+    const content: unknown = data?.choices?.[0]?.message?.content;
+    if (typeof content !== 'string' || !content) return null;
+
     const parsed = JSON.parse(extractJSON(content));
     if (Array.isArray(parsed) && parsed.every(item => typeof item === 'string')) {
       return parsed as string[];
     }
     return null;
-  } catch {
+  } catch (err) {
+    const name = err instanceof Error ? err.name : 'Error';
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`LLM call failed (${name}): ${message.slice(0, MAX_LOGGED_BODY_CHARS)}`);
     return null;
   }
 }
 
-export async function swap(text: string, level: Level): Promise<Segment[]> {
+export interface SwapOptions {
+  deadlineMs?: number;
+}
+
+export async function swap(text: string, level: Level, options: SwapOptions = {}): Promise<SwapResult> {
+  const deadlineMs = options.deadlineMs ?? SWAP_DEADLINE_MS;
+  const startedAt = Date.now();
+  const remaining = () => deadlineMs - (Date.now() - startedAt);
+
   const apiKey = process.env.OPENROUTER_API_KEY;
   const model = process.env.OPENROUTER_MODEL ?? 'qwen/qwen3-8b';
   const baseUrl = process.env.OPENROUTER_BASE_URL ?? 'https://openrouter.ai/api/v1';
@@ -94,33 +116,35 @@ export async function swap(text: string, level: Level): Promise<Segment[]> {
     return fallback(text);
   }
 
-  let spans: ReturnType<typeof selectSpans>;
+  let spans: Span[];
   try {
     spans = selectSpans(text, level);
   } catch (err) {
     console.error('Tagger error:', err);
     return fallback(text);
   }
-  if (spans.length === 0) return fallback(text);
+  // Nothing worth swapping (e.g. only names and numbers): not a failure.
+  if (spans.length === 0) {
+    return { segments: [{ text, lang: 'source', translation: null }], degraded: false };
+  }
 
-  try {
-    // First attempt: full context + numbered list
-    let translations = await callModel(baseUrl, apiKey, model, buildUserMessage(text, spans));
+  // First attempt: full context + numbered list
+  let translations = await callModel(baseUrl, apiKey, model, buildUserMessage(text, spans), remaining());
 
-    // Retry with context-free prompt if count mismatches
-    if (!translations || translations.length !== spans.length) {
-      console.warn(`Count mismatch (got ${translations?.length ?? 0}, expected ${spans.length}). Retrying.`);
-      translations = await callModel(baseUrl, apiKey, model, buildRetryMessage(spans));
-    }
-
-    if (!translations || translations.length !== spans.length) {
-      console.error('Translation count mismatch after retry — returning original text');
+  // Retry with context-free prompt if count mismatches, time permitting
+  if (!translations || translations.length !== spans.length) {
+    if (remaining() < Math.min(MIN_RETRY_MS, deadlineMs / 3)) {
+      console.error('No time left to retry — returning original text');
       return fallback(text);
     }
+    console.warn(`Count mismatch (got ${translations?.length ?? 0}, expected ${spans.length}). Retrying.`);
+    translations = await callModel(baseUrl, apiKey, model, buildRetryMessage(spans), remaining());
+  }
 
-    return reconstructSegments(text, spans, translations);
-  } catch (err) {
-    console.error('Swap engine error:', err);
+  if (!translations || translations.length !== spans.length) {
+    console.error('Translation count mismatch after retry — returning original text');
     return fallback(text);
   }
+
+  return { segments: reconstructSegments(text, spans, translations), degraded: false };
 }
