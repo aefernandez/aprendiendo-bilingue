@@ -23,7 +23,8 @@ export function reconstructSegments(
     segments.push({ text: original.slice(cursor), lang: 'source', translation: null });
   }
 
-  return segments.filter(s => s.text.trim().length > 0);
+  // Keep whitespace-only gaps: dropping them glues neighbouring phrases together.
+  return segments.filter(s => s.text.length > 0);
 }
 
 export function expandToWords(segments: Segment[]): Word[] {
