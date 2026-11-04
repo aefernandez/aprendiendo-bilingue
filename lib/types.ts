@@ -1,3 +1,5 @@
+import type { DebugEvent } from './diagnostics';
+
 export type Level = 1 | 2 | 3;
 
 export interface Segment {
@@ -19,6 +21,17 @@ export interface Span {
   start: number;
   end: number;
   text: string;
+}
+
+export interface SwapResult {
+  segments: Segment[];
+  // True when the engine fell back to the original text (LLM slow, down, or
+  // returned something unusable). The UI should say so instead of implying
+  // the text was mixed.
+  degraded: boolean;
+  // What happened during the request, for the in-app debug console. Omitted
+  // from API responses when NEXT_PUBLIC_DEBUG_CONSOLE=false.
+  debug?: DebugEvent[];
 }
 
 export interface SwapRequest {
