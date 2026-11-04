@@ -2,6 +2,7 @@ import type { Level, Span, SwapResult } from './types';
 import { selectSpans } from './tagger';
 import { reconstructSegments } from './segmenter';
 import { loadLlmConfig, missingKey, type LlmConfig } from './llmConfig';
+import { Diagnostics } from './diagnostics';
 
 // ---------------------------------------------------------------------------
 // Prompts
@@ -142,8 +143,18 @@ export function maxTokensFor(spans: Span[]): number {
   return Math.min(8192, Math.max(512, 256 + Math.ceil(chars * 0.75) + spans.length * 16));
 }
 
-function fallback(text: string): SwapResult {
-  return { segments: [{ text, lang: 'source', translation: null }], degraded: true };
+function fallback(text: string, diag: Diagnostics): SwapResult {
+  return { segments: [{ text, lang: 'source', translation: null }], degraded: true, debug: diag.events };
+}
+
+function describeBackend(config: LlmConfig): string {
+  let host = config.baseUrl;
+  try {
+    host = new URL(config.baseUrl).host;
+  } catch {
+    // Show the raw value; the call will fail and say why.
+  }
+  return `model ${config.model} via ${host}`;
 }
 
 async function callModel(
@@ -151,6 +162,8 @@ async function callModel(
   userMessage: string,
   spans: Span[],
   timeoutMs: number,
+  diag: Diagnostics,
+  attempt: string,
 ): Promise<string[] | null> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
@@ -184,19 +197,41 @@ async function callModel(
 
     if (!response.ok) {
       const errorBody = await response.text().catch(() => '');
-      console.error('LLM error:', response.status, errorBody.slice(0, MAX_LOGGED_BODY_CHARS));
+      diag.error(
+        `${attempt}: LLM error ${response.status} from ${config.model}`,
+        errorBody.slice(0, MAX_LOGGED_BODY_CHARS),
+      );
       return null;
     }
 
-    const data = await response.json();
-    const content: unknown = data?.choices?.[0]?.message?.content;
-    if (typeof content !== 'string' || !content) return null;
+    const raw = await response.text();
+    let data: unknown;
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      diag.error(`${attempt}: LLM returned a non-JSON response`, raw.slice(0, MAX_LOGGED_BODY_CHARS));
+      return null;
+    }
+    const content: unknown = (data as { choices?: { message?: { content?: unknown } }[] })?.choices?.[0]?.message
+      ?.content;
+    if (typeof content !== 'string' || !content) {
+      diag.error(`${attempt}: LLM reply had no message content`, raw.slice(0, MAX_LOGGED_BODY_CHARS));
+      return null;
+    }
 
-    return parseTranslations(content, spans.length);
+    const translations = parseTranslations(content, spans.length);
+    if (!translations) {
+      diag.error(
+        `${attempt}: couldn't use the model's reply (expected ${spans.length} numbered translations)`,
+        content.slice(0, MAX_LOGGED_BODY_CHARS),
+      );
+    }
+    return translations;
   } catch (err) {
     const name = err instanceof Error ? err.name : 'Error';
     const message = err instanceof Error ? err.message : String(err);
-    console.error(`LLM call failed (${name}): ${message.slice(0, MAX_LOGGED_BODY_CHARS)}`);
+    const reason = name === 'TimeoutError' ? `timed out after ${timeoutMs} ms` : `failed (${name})`;
+    diag.error(`${attempt}: LLM call ${reason}`, message.slice(0, MAX_LOGGED_BODY_CHARS));
     return null;
   }
 }
@@ -215,39 +250,43 @@ export async function swap(text: string, level: Level, options: SwapOptions = {}
   const startedAt = Date.now();
   const remaining = () => deadlineMs - (Date.now() - startedAt);
 
+  const diag = new Diagnostics();
   const config = options.config ?? loadLlmConfig();
   if (missingKey(config)) {
-    console.error('LLM_API_KEY is not set — returning original text');
-    return fallback(text);
+    diag.error('LLM_API_KEY is not set — returning original text');
+    return fallback(text, diag);
   }
 
   let spans: Span[];
   try {
     spans = selectSpans(text, level);
   } catch (err) {
-    console.error('Tagger error:', err);
-    return fallback(text);
+    diag.error('Tagger error — returning original text', err instanceof Error ? (err.stack ?? err.message) : String(err));
+    return fallback(text, diag);
   }
   // Nothing worth swapping (e.g. only names and numbers): not a failure.
   if (spans.length === 0) {
-    return { segments: [{ text, lang: 'source', translation: null }], degraded: false };
+    diag.info(`Level ${level}: no phrases selected to swap`);
+    return { segments: [{ text, lang: 'source', translation: null }], degraded: false, debug: diag.events };
   }
+  diag.info(`Level ${level}: ${spans.length} phrases → ${describeBackend(config)}`);
 
-  let translations = await callModel(config, buildUserMessage(text, spans), spans, remaining());
+  let translations = await callModel(config, buildUserMessage(text, spans), spans, remaining(), diag, 'Attempt 1');
 
   if (!translations) {
     if (remaining() < Math.min(MIN_RETRY_MS, deadlineMs / 3)) {
-      console.error('No time left to retry — returning original text');
-      return fallback(text);
+      diag.error('No time left to retry — returning original text');
+      return fallback(text, diag);
     }
-    console.warn(`Invalid translations for ${spans.length} phrases. Retrying.`);
-    translations = await callModel(config, buildRetryMessage(text, spans), spans, remaining());
+    diag.warn(`Retrying ${spans.length} phrases`);
+    translations = await callModel(config, buildRetryMessage(text, spans), spans, remaining(), diag, 'Attempt 2');
   }
 
   if (!translations) {
-    console.error('Invalid translations after retry — returning original text');
-    return fallback(text);
+    diag.error('No usable translations after retry — returning original text');
+    return fallback(text, diag);
   }
 
-  return { segments: reconstructSegments(text, spans, translations), degraded: false };
+  diag.info(`Done in ${Date.now() - startedAt} ms`);
+  return { segments: reconstructSegments(text, spans, translations), degraded: false, debug: diag.events };
 }

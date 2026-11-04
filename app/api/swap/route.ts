@@ -1,5 +1,6 @@
 import { swap } from '@/lib/swapEngine';
 import { parseSwapRequest } from '@/lib/validation';
+import { debugConsoleEnabled } from '@/lib/diagnostics';
 
 // The swap engine enforces its own ~14 s deadline (spec: results within 15 s).
 // This is a platform-level backstop so a stuck request can't run indefinitely.
@@ -19,5 +20,6 @@ export async function POST(request: Request) {
   }
 
   const result = await swap(parsed.value.text, parsed.value.level);
+  if (!debugConsoleEnabled()) delete result.debug;
   return Response.json(result);
 }

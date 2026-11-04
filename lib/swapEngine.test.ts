@@ -96,7 +96,9 @@ describe('swap', () => {
   it('marks the result degraded when no API key is configured', async () => {
     vi.stubEnv('OPENROUTER_API_KEY', '');
     const result = await swap(TEXT, LEVEL);
-    expect(result).toEqual({ segments: [{ text: TEXT, lang: 'source', translation: null }], degraded: true });
+    expect(result.segments).toEqual([{ text: TEXT, lang: 'source', translation: null }]);
+    expect(result.degraded).toBe(true);
+    expect(result.debug?.[0].message).toContain('LLM_API_KEY is not set');
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -147,5 +149,33 @@ describe('swap', () => {
     const result = await swap('John and Mary, 1962.', LEVEL);
     expect(result.degraded).toBe(false);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('reports upstream errors in debug events, with model and response body', async () => {
+    vi.stubEnv('OPENROUTER_MODEL', 'retired/model');
+    const notFound = () =>
+      new Response('{"error":{"message":"retired/model is no longer available"}}', { status: 404 });
+    fetchMock.mockResolvedValueOnce(notFound()).mockResolvedValueOnce(notFound());
+    const result = await swap(TEXT, LEVEL);
+    expect(result.degraded).toBe(true);
+    const errors = result.debug!.filter((e) => e.level === 'error');
+    expect(errors[0].message).toContain('LLM error 404 from retired/model');
+    expect(errors[0].detail).toContain('no longer available');
+    expect(errors.at(-1)!.message).toContain('returning original text');
+    expect(result.debug![0].message).toContain('retired/model via openrouter.ai');
+  });
+
+  it('never puts the API key in debug events', async () => {
+    fetchMock.mockResolvedValueOnce(new Response('bad', { status: 401 })).mockResolvedValueOnce(
+      new Response('bad', { status: 401 }),
+    );
+    const result = await swap(TEXT, LEVEL);
+    expect(JSON.stringify(result.debug)).not.toContain('test-key');
+  });
+
+  it('reports a reply it could not parse', async () => {
+    fetchMock.mockResolvedValue(completion('not json at all'));
+    const result = await swap(TEXT, LEVEL);
+    expect(result.debug!.some((e) => e.message.includes("couldn't use the model's reply"))).toBe(true);
   });
 });
