@@ -13,12 +13,22 @@ function completion(content: string) {
 }
 
 function translationsFor(text: string) {
-  return selectSpans(text, LEVEL).map(s => `IT(${s.text})`);
+  return {
+    translations: selectSpans(text, LEVEL).map((s, i) => ({ i: i + 1, t: `IT(${s.text})` })),
+  };
 }
 
-describe('swap', () => {
-  const fetchMock = vi.fn<typeof fetch>();
+function requestBody(call: number) {
+  return JSON.parse(String(fetchMock.mock.calls[call][1]?.body));
+}
 
+function requestHeaders(call: number) {
+  return fetchMock.mock.calls[call][1]?.headers as Record<string, string>;
+}
+
+const fetchMock = vi.fn<typeof fetch>();
+
+describe('swap', () => {
   beforeEach(() => {
     vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
     vi.stubGlobal('fetch', fetchMock);
@@ -41,6 +51,48 @@ describe('swap', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it('sends Gemma 4 with an enforced JSON schema to OpenRouter by default', async () => {
+    fetchMock.mockResolvedValueOnce(completion(JSON.stringify(translationsFor(TEXT))));
+    await swap(TEXT, LEVEL);
+    const [url] = fetchMock.mock.calls[0];
+    expect(url).toBe('https://openrouter.ai/api/v1/chat/completions');
+    const body = requestBody(0);
+    expect(body.model).toBe('google/gemma-4-26b-a4b-it');
+    expect(body.response_format.type).toBe('json_schema');
+    expect(body.provider).toEqual({ require_parameters: true });
+    expect(body.max_tokens).toBeLessThan(8192);
+    expect(requestHeaders(0).Authorization).toBe('Bearer test-key');
+  });
+
+  it('works against a key-less local server with config only', async () => {
+    vi.stubEnv('OPENROUTER_API_KEY', '');
+    vi.stubEnv('LLM_BASE_URL', 'http://localhost:11434/v1/');
+    vi.stubEnv('LLM_MODEL', 'gemma4:26b');
+    fetchMock.mockResolvedValueOnce(completion(JSON.stringify(translationsFor(TEXT))));
+    const result = await swap(TEXT, LEVEL);
+    expect(result.degraded).toBe(false);
+    expect(fetchMock.mock.calls[0][0]).toBe('http://localhost:11434/v1/chat/completions');
+    const headers = requestHeaders(0);
+    expect(headers.Authorization).toBeUndefined();
+    expect(headers['HTTP-Referer']).toBeUndefined();
+    expect(requestBody(0).model).toBe('gemma4:26b');
+    expect(requestBody(0).provider).toBeUndefined();
+  });
+
+  it('omits response_format when structured outputs are turned off', async () => {
+    vi.stubEnv('LLM_STRUCTURED_OUTPUTS', 'false');
+    fetchMock.mockResolvedValueOnce(completion(JSON.stringify(translationsFor(TEXT))));
+    await swap(TEXT, LEVEL);
+    expect(requestBody(0).response_format).toBeUndefined();
+  });
+
+  it('keeps the full text in the retry prompt', async () => {
+    fetchMock.mockImplementation(async () => completion('{"translations":[]}'));
+    await swap(TEXT, LEVEL);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(requestBody(1).messages[1].content).toContain(`Full text: ${TEXT}`);
+  });
+
   it('marks the result degraded when no API key is configured', async () => {
     vi.stubEnv('OPENROUTER_API_KEY', '');
     const result = await swap(TEXT, LEVEL);
@@ -49,7 +101,7 @@ describe('swap', () => {
   });
 
   it('retries once on a wrong count, then degrades', async () => {
-    fetchMock.mockImplementation(async () => completion('["only one"]'));
+    fetchMock.mockImplementation(async () => completion('{"translations":[{"i":1,"t":"solo uno"}]}'));
     const result = await swap(TEXT, LEVEL);
     expect(result.degraded).toBe(true);
     expect(fetchMock).toHaveBeenCalledTimes(2);

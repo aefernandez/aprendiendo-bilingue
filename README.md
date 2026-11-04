@@ -1,36 +1,34 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Aprendiendo Bilingüe
 
-## Getting Started
+Paste any English text and read it partly translated into Italian. Pick how much Italian you want (three levels), then tap any Italian phrase to see what it means.
 
-First, run the development server:
+## Getting started
 
 ```bash
+npm install
+cp .env.example .env.local   # add your OpenRouter key
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000).
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## How it works
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+1. `lib/tagger.ts` picks which words to swap for the chosen level, using part-of-speech tags from [compromise](https://github.com/spencermountain/compromise). Names, numbers and contact details are never swapped.
+2. `lib/swapEngine.ts` sends the full text plus a numbered list of those phrases to an LLM and asks for a JSON list of translations, checked by index. If the model is slow, down, or returns something unusable, the reader shows the original text with a notice (`degraded: true`).
+3. `lib/segmenter.ts` puts each translation back at its exact position in the original text.
 
-## Learn More
+## Model and backend
 
-To learn more about Next.js, take a look at the following resources:
+The default model is **Gemma 4 26B-A4B** (`google/gemma-4-26b-a4b-it`) via OpenRouter, with structured JSON output enforced. Any OpenAI-compatible backend works with configuration only — see `.env.example` for running a local model through Ollama or vLLM with no API key.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Scripts
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+| Command | What it does |
+|---|---|
+| `npm run dev` | Start the dev server |
+| `npm test` | Run the unit tests (vitest) |
+| `npm run lint` | Lint |
+| `npm run build` | Production build |
 
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+The product spec lives in `Aprendiendo Bilingue Requirements.md`.
