@@ -1,14 +1,23 @@
 import { swap } from '@/lib/swapEngine';
-import type { SwapRequest } from '@/lib/types';
+import { parseSwapRequest } from '@/lib/validation';
+
+// The swap engine enforces its own ~14 s deadline (spec: results within 15 s).
+// This is a platform-level backstop so a stuck request can't run indefinitely.
+export const maxDuration = 20;
 
 export async function POST(request: Request) {
-  const body = (await request.json()) as SwapRequest;
-  const { text, level } = body;
-
-  if (!text?.trim() || !level) {
-    return Response.json({ error: 'Missing text or level' }, { status: 400 });
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return Response.json({ error: 'Request body must be valid JSON.' }, { status: 400 });
   }
 
-  const segments = await swap(text.trim(), level);
-  return Response.json({ segments });
+  const parsed = parseSwapRequest(body);
+  if (!parsed.ok) {
+    return Response.json({ error: parsed.error }, { status: 400 });
+  }
+
+  const result = await swap(parsed.value.text, parsed.value.level);
+  return Response.json(result);
 }
