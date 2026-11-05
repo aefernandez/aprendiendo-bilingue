@@ -1,6 +1,6 @@
 # Plan: target-language selection with automatic source detection
 
-*Nov 2026 · Drafted by an architect and a detection researcher, then attacked by three adversarial reviewers (technical, product/spec, cost/ops). What changed because of each review is logged at the end.*
+*Nov 2026 · Drafted by an architect and a detection researcher, then attacked by three adversarial reviewers (technical, product/spec, cost/ops), with a second technical review of the redesigned span format. What changed because of each review is logged at the end.*
 
 ## The short answer
 
@@ -181,10 +181,12 @@ The text is split into words on the server. The model sees them numbered and ret
 
 ```
 Input:  [0]Juan [1]come [2]pan [3]y [4]bebe [5]agua. [6]Luego [7]come [8]fruta.
-Output: {"i":[[1,2,"mangia il pane","v"],[7,8,"mangia frutta","v"]]}
+Output: {"i":[[1,2,"come","mangia il pane","v"],[7,8,"come","mangia frutta","v"]]}
 ```
 
-Each item is `[startWord, endWord, translation, posCode]`.
+Each item is `[startWord, endWord, anchor, translation, posCode]`:
+- Ranges are **inclusive**, and indices are **local to each chunk**, restarting at 0. The prompt states both and gives one worked example.
+- `anchor` is the first source word of the range, copied by the model. It costs about 2 tokens per item and makes mis-numbering detectable on every call (see validation below).
 
 **Why indices instead of the earlier "model echoes the source substring" design.** The technical review prototyped the substring aligner and broke it repeatedly:
 
@@ -195,30 +197,41 @@ Each item is `[startWord, endWord, translation, posCode]`.
 | Copy variants dropped the item | Curly vs straight apostrophes, non-breaking spaces, sentence-initial capitals |
 | An apostrophe split a word | "don" + "t know" |
 
-Echoing the source also doubles output tokens, and output tokens are what dominate latency.
+The case for indices is **correctness, not tokens**. A follow-up review counted tokens on a 1,040-word Spanish text with 278 items (o200k tokenizer; Gemma's may differ):
+
+| Format | Output tokens |
+|---|---|
+| Substring, object keys (first draft) | 6,097 |
+| Index format | 4,226 |
+| Substring, compact arrays | 3,869 |
+| Translations alone | 1,998 |
+
+Indices cost about the same as compact substring arrays. Input grows about 4× (about 1.2K → 4.8K tokens) because of the numbering, which costs some prefill time but little money.
 
 With indices:
 - Offsets come from our own tokenizer, so they are exact by construction.
+- **Anchor check.** The anchor must match the token at `startWord`, case-insensitively. On a mismatch, look for it at ±1 and ±2 and shift the range; otherwise drop the item. The mismatch rate is logged on every call and gated in B2.
 - Validation becomes simple integer checks:
   - ranges in bounds, ascending, and not overlapping;
-  - a range must not cross a sentence boundary;
+  - a range must not cross a sentence boundary, using the chunker's corrected boundaries (so "EE. UU." and "Sr. García" stay legal);
   - the translation must be non-empty, contain no newline or URL, and be at most 4× the source length + 20 characters (this also caps prompt-injection output);
   - if the translation equals the source (a cognate such as *hotel*), keep it as "not swapped", not as an error.
 
-**Risk:** the model may mis-number. That's why B2 measures it before committing.
-- An index error shows up as a wrong-but-valid swap, not a dropped one.
-- So the eval includes a judge that checks each source-to-target pairing.
-- If the index-error rate is high, fall back to the substring design with the review's fixes:
+**Risk:** the model may mis-number. The likely errors are off-by-one (the `[n]` sits right after the previous word's punctuation), treating `endWord` as exclusive, and drift late in long chunks.
+- Without the anchor, an index error would be a silent wrong-but-valid swap. With it, most errors are caught and repaired or dropped at runtime, and counted.
+- The eval's judge sample remains as a secondary check for errors the anchor can't see (a correct start with a wrong end).
+- If the anchor-mismatch rate exceeds the B2 gate, fall back to the substring design with the review's fixes:
   - map quotes and NBSP one-for-one on both sides;
   - search for each item within its own sentence;
   - case-insensitive fallback match;
   - treat an apostrophe between letters as part of the word.
 
 **Word tokenizer:**
-- `Intl.Segmenter(sourceLocale, { granularity: 'word' })`, with an apostrophe between letters kept inside the word.
-- Only word-like tokens get indices; punctuation and spaces sit between them.
+- `Intl.Segmenter(sourceLocale, { granularity: 'word' })`, with an apostrophe between letters kept inside the word, and letter-hyphen-letter merged into one token (well-known, e-mail, post-COVID).
+- URLs and email addresses are masked before tokenizing, so they get no index. Unmasked, a single URL became 6 indexed tokens.
+- Only word-like tokens get indices; punctuation and spaces sit between them. Emoji, `¿`/`¡` and quotes stay outside tokens and pass through untouched.
 - Today's exclusions (names, numbers) move into the prompt rule.
-- Tokens that are only digits are never valid starts or ends of a range.
+- A token is **numeric** if it contains a digit and no letter (3,5 · 1.000 · 10:30). Numeric tokens are never valid range ends. Note that Intl.Segmenter keeps `2º`, `3años` and `30h` as single tokens; test them explicitly.
 
 **Not part of this design:** `lib/tagger.ts` (compromise) stays only behind `SWAP_SPANS=tagger` for en→it during rollout, then is deleted.
 
@@ -229,8 +242,8 @@ The cost review re-derived the numbers. At level 3, the earlier design needed ab
 Changes:
 
 - **Fewer output tokens.**
-  - Index format with one-letter POS codes and compact keys: about 10 tokens of overhead per item.
-  - Level 3 on 1,000 words is about 250 items, roughly 2.5–3K output tokens in total.
+  - Compact arrays with one-letter POS codes: about 8–10 tokens of overhead per item on top of the translation.
+  - Level 3 on 1,000 words is about 250–280 items, roughly 3.5–4.2K output tokens in total, or about 300–350 per chunk across 12 chunks. This only fits 15 s if each chunk runs in parallel on a provider near 110 tok/s, which is why B2 measures it first.
   - `max_tokens` is sized per chunk.
   - A cut-off reply is salvaged up to its last complete item.
 - **Chunks.**
@@ -246,7 +259,7 @@ Changes:
   - Never retry a 429; honour `Retry-After`.
   - At most 2 chunk retries per request, and only if more than 4 s remain.
   - If more than half the chunks fail, stop early and return degraded.
-- **Expected result:** about 250–400 output tokens per chunk at about 110 tok/s, so 3–5 s per chunk with all chunks in parallel. B2 confirms this before B3 is built.
+- **Expected result:** about 300–400 output tokens per chunk at about 110 tok/s, so 3–5 s per chunk with all chunks in parallel, plus prefill for the larger numbered input. B2 confirms this before B3 is built.
 
 **`partial` vs `degraded`:**
 - Some chunks fell back to source text → `partial: true`, and the reader shows a quiet notice.
@@ -300,7 +313,8 @@ So protection is required before B3's default flips, not a risk to note:
 
 | Test | What it covers |
 |---|---|
-| Tokenizer | Apostrophes (don't), clitics (dámelo), del/al, accents NFC and NFD, curly quotes, emoji |
+| Tokenizer | Apostrophes (don't, O'Brien, rock'n'roll, plural possessive dogs'), hyphens (well-known, e-mail), clitics (dámelo), del/al, accents NFC and NFD, curly quotes, emoji, `¿`/`¡`, numbers (3,5 · 1.000 · 10:30h · 2º · 3años), URLs and emails masked |
+| Anchor check | Exact match, off-by-one repaired, ±2 repaired, no match dropped, exclusive-end mistake |
 | Chunker | Abbreviations, a 3,200-character run with no punctuation, `MAX_CHUNKS`, offsets round-trip |
 | Item validator | Out-of-range, overlapping and sentence-crossing ranges, cognates, oversized or URL translations |
 | `sourceLanguage` (real eld, which is fast and deterministic) | Each path in A2; Catalan, Portuguese, Galician and French negatives; English-quote-first Spanish article (three-window vote); single-score margin; failed eld import; concurrent calls for different targets |
@@ -340,7 +354,7 @@ Every PR branches from fresh `origin/main` and targets `main`. Check with `gh pr
 | **A2** | eld detection, `/api/detect`, 422 checks on every path, `ENABLED_PAIRS`, rate limit on both routes | ~250 lines | Detection unit tests pass; eld absent from the client bundle (check the build output); cold request +<250 ms; Spanish input gets "coming soon" before any LLM call |
 | **A3** | Picker, pre-submit source chip, persistence, localized chrome (if kept), a11y fixes | ~250 lines | Target survives a reload; override works; 422 UIs work; mobile QA with the keyboard open |
 | **B1** | Spend cap, `usage` logging, structured log line, debug console opt-in | ~150 lines | Spend cap blocks when over; alert fires in a test |
-| **B2** | Eval harness, fixtures, tagger baseline, plus a one-chunk spike comparing index vs substring format on two providers | ~350 lines + fixtures | Baseline and spike numbers committed back into this plan; format decision confirmed |
+| **B2** | Eval harness, fixtures, tagger baseline, plus a spike comparing index (with anchor) vs compact-substring format on two providers, across all fixtures, not a single chunk | ~350 lines + fixtures | Baseline and spike numbers committed back into this plan; anchor-mismatch rate ≤ 2% before repair, or switch to the substring format; single-chunk p95 measured |
 | **B3** | Tokenizer, chunker, index-format engine, validator, parallel calls, retry budget, provider routing, `pos` (behind `SWAP_SPANS`) | ~450 lines | Unit tests pass; eval gates pass for all three pairs (Spanish pairs enabled in the eval only) |
 | **B4** | Flip `SWAP_SPANS=llm`, add `es-en,es-it` to `ENABLED_PAIRS`, show `pos` on the definition card | Config + ~50 lines | Mobile QA on all three pairs; live degraded+partial rate < 3% for a week |
 | **B5** | Delete compromise and `tagger.ts` | Deletion | After B4's week is clean |
@@ -360,7 +374,8 @@ A1 and B2 can be built in parallel. B1 can merge any time before B4.
 
 ## Risks still open
 
-- **Index mis-numbering by the model.** Measured in B2, with a substring fallback design ready.
+- **Index mis-numbering by the model.** Caught at runtime by the anchor check, gated in B2, with a substring fallback design ready.
+- **Latency is still tight at level 3.** About 3.5–4.2K output tokens per 1,000 words only fits in parallel on a fast provider. B2 measures this before B3 is built.
 - **Calibration drift per model.** Re-run the eval whenever `LLM_MODEL` changes.
 - **Grammar restructuring is still impossible.** Source text is never rewritten. Accepted for v1; the spec calls it a quality bar, not a rule.
 - **Related-language sources** (Catalan, Portuguese, Galician near Spanish) will need re-tuned thresholds if any are added. That's where detection becomes genuinely hard.
@@ -410,3 +425,13 @@ Three adversarial reviewers attacked the first draft independently. They prototy
 | Debug console public in production | Opt-in proposal |
 | eld on joined translations is a weak language check | Replaced by a required judge sample |
 | Prompt injection | Translation length and URL caps |
+
+### Technical re-review of the index design
+
+| Finding | What changed |
+|---|---|
+| Mis-numbering would be a silent wrong-but-valid swap, and a 30-item judge sample can't measure its rate | Anchor word per item, checked and repaired at runtime; mismatch rate gated in B2 |
+| Token estimate undersized (measured 4,226 output tokens vs compact substring 3,869) | Estimate corrected to 3.5–4.2K; indices justified by correctness, not tokens; indices are chunk-local |
+| Numbers, URLs and emails got indices; a digits-only test misses 3,5 and 1.000 | Numeric = digit and no letter; URLs and emails masked |
+| Hyphenated compounds split ("bien-known") | Letter-hyphen-letter merged into one token |
+| Sentence validator would reject "EE. UU." | Validator uses the chunker's corrected boundaries |
