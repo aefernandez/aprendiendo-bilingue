@@ -48,8 +48,16 @@ describe('firstSentence', () => {
     ['"Come early," she said. Then she left.', '"Come early," she said.'],
     ['Subject: Office move\n\nHi everyone,', 'Subject: Office move'],
     ['No ending at all', 'No ending at all'],
+    ['Neither did I. We left early.', 'Neither did I.'],
+    ['Hi\u00a0Mr. Dale came. Then he left.', 'Hi\u00a0Mr. Dale came.'],
+    ['¡¡Atención, vecinos!! 🎉 La Sra. Gómez llega.', '¡¡Atención, vecinos!!'],
+    ['Quedamos en la plaza del Ayto. ¿Venís?', 'Quedamos en la plaza del Ayto. ¿Venís?'],
   ])('%j → %j', (input, expected) => {
     expect(firstSentence(input)).toBe(expected);
+  });
+
+  it('reads "I." as an initial in Spanish', () => {
+    expect(firstSentence('Habló con I. Pazos. Luego se fue.', 'es')).toBe('Habló con I. Pazos.');
   });
 });
 
@@ -63,6 +71,23 @@ describe('firstWords', () => {
     expect(firstWords('Two words', 5, 'en')).toBe('Two words');
   });
 });
+
+// Weekdays, months, a.m./p.m., currency and units stay unprotected in both
+// languages: a learner may want them swapped, and a 0-miss gate must treat
+// en and es alike.
+const DATE_OR_UNIT = new RegExp(
+  '(^|[^\\p{L}])(' +
+    [
+      '(mon|tues|wednes|thurs|fri|satur|sun)days?',
+      'january|february|march|april|may|june|july|august|september|october|november|december',
+      'jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec',
+      'lunes|martes|miércoles|jueves|viernes|sábados?|domingos?|sáb|dom',
+      'enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre',
+      'a\\.\\s?m\\.|p\\.\\s?m\\.|million|millones|km|mi',
+    ].join('|') +
+    ')([^\\p{L}]|$)|[$€%]',
+  'iu',
+);
 
 describe('fixture lint', () => {
   const fixtures = loadFixtures();
@@ -105,6 +130,13 @@ describe('fixture lint', () => {
       }
     });
 
+    it('protects only names, numerals, URLs, emails and handles (no dates, times or units)', () => {
+      for (const p of f.protected) {
+        expect(p.text, p.text).not.toMatch(DATE_OR_UNIT);
+        expect(p.text, p.text).toMatch(/^[@#]|https?:\/\/|@|\d|^\p{Lu}/u);
+      }
+    });
+
     it('is within ±15% of its target word count', () => {
       expect(f.wordCount).toBeGreaterThanOrEqual(Math.floor(f.words * 0.85));
       expect(f.wordCount).toBeLessThanOrEqual(Math.ceil(f.words * 1.15));
@@ -112,10 +144,10 @@ describe('fixture lint', () => {
     });
 
     it('has metadata and detection variants', () => {
-      expect(f.nativeChecked).toBe(false);
+      expect(typeof f.nativeChecked).toBe('boolean');
       expect(f.firstSentence.length).toBeGreaterThan(0);
       expect(f.text).toContain(f.firstSentence);
-      expect(f.text.startsWith(f.first5Words) || f.text.includes(f.first5Words)).toBe(true);
+      expect(f.text).toContain(f.first5Words);
       expect(countWords(f.first5Words, f.lang)).toBe(5);
     });
   });

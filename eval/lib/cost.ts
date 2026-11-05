@@ -4,6 +4,13 @@
 // stale in every estimate: check https://openrouter.ai/<model> before a large
 // run. Actual spend is taken from `usage.cost` in each response when present.
 
+import { DEFAULT_MODEL } from '../../lib/llmConfig';
+
+/** The model the engine will actually call in an eval worker; plan items should use it. */
+export function evalModel(env: Record<string, string | undefined> = process.env): string {
+  return env.LLM_MODEL?.trim() || DEFAULT_MODEL;
+}
+
 export interface Price {
   inputPerM: number;
   outputPerM: number;

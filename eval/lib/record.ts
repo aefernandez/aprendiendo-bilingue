@@ -1,7 +1,7 @@
 // Fetch recorder. Wraps a fetch implementation so every upstream call made
 // while an eval item runs is recorded against that item, even when items run
 // concurrently (AsyncLocalStorage). The wrapper:
-//   - refuses the call unless EVAL=1 && EVAL_YES=1 (guard.ts);
+//   - refuses the call unless live calls are allowed (guard.ts guardFetch);
 //   - records wall time (to the end of a JSON body) and HTTP status;
 //   - reads `usage.prompt_tokens`, `usage.completion_tokens`, `usage.cost`,
 //     top-level `provider`, `id` and `model` from a JSON body only if present
@@ -10,7 +10,7 @@
 // It never records headers (Authorization) or request/response bodies.
 
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { assertLiveCallsAllowed, type Env } from './guard';
+import { LiveCallRefused, describeUrl, guardFetch, type Env } from './guard';
 
 export interface CallUsage {
   promptTokens?: number;
@@ -56,16 +56,6 @@ export function readResponseFields(body: unknown): Pick<CallRecord, 'provider' |
   return out;
 }
 
-function describeUrl(input: Parameters<Fetch>[0]): string {
-  const raw = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-  try {
-    const u = new URL(raw);
-    return `${u.origin}${u.pathname}`; // drop the query string
-  } catch {
-    return String(raw).split('?')[0];
-  }
-}
-
 export interface Recorder {
   /** The guarded, recording fetch. Install it as globalThis.fetch for engine code. */
   fetch: Fetch;
@@ -76,25 +66,21 @@ export interface Recorder {
 export function createRecorder(inner: Fetch, env: Env = process.env, now: () => number = () => performance.now()): Recorder {
   const store = new AsyncLocalStorage<CallRecord[]>();
 
+  const guarded = guardFetch(inner, env);
+
   const recordingFetch: Fetch = async (input, init) => {
     const url = describeUrl(input);
     const record: CallRecord = { url, method: init?.method ?? 'GET', ms: 0 };
     store.getStore()?.push(record);
-    try {
-      assertLiveCallsAllowed(url, env);
-    } catch (err) {
-      // Recorded so the runner notices even if engine code swallows the error.
-      record.refused = true;
-      record.error = err instanceof Error ? err.message : String(err);
-      throw err;
-    }
     const t0 = now();
     let response: Response;
     try {
-      response = await inner(input, init);
+      response = await guarded(input, init);
     } catch (err) {
       record.ms = now() - t0;
       record.error = err instanceof Error ? err.message : String(err);
+      // Recorded so the runner notices even if engine code swallows the error.
+      if (err instanceof LiveCallRefused) record.refused = true;
       throw err;
     }
     record.status = response.status;

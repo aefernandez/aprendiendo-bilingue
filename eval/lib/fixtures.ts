@@ -107,9 +107,10 @@ const ABBREVIATIONS = new Set([
   'ee', 'uu', 'ej', 'ayto', 'avda', 'pág', 'núm', 'tel', 'sáb', 'dom', 'lun', 'mié', 'vie',
 ]);
 
-function isAbbreviation(token: string): boolean {
+function isAbbreviation(token: string, lang: string): boolean {
   const bare = token.replace(/^[("“‘«¿¡]+/, '').replace(/\.$/, '');
   if (bare.length === 0) return false;
+  if (bare === 'I' && lang === 'en') return false; // "Neither did I. We left." is a sentence end
   if ([...bare].length === 1 && /\p{L}/u.test(bare)) return true;
   if (bare.includes('.')) return true;
   return ABBREVIATIONS.has(bare.toLowerCase());
@@ -117,13 +118,16 @@ function isAbbreviation(token: string): boolean {
 
 const SENTENCE_END = /[.!?…]/;
 const CLOSERS = /[)"'”’»]/;
-const STARTERS = /[\p{Lu}\p{N}¿¡"“‘«(]/u;
+const LOWERCASE = /\p{Ll}/u;
 
 /**
  * First sentence (or first line, for headlines and subject lines). A small
- * rule set, good enough for detection variants; manifest overrides cover misfires.
+ * rule set, good enough for detection variants; manifest overrides cover
+ * misfires. Known limit: a single capital before a period is read as an
+ * initial ("vitamin C. It helps." doesn't split). Switch to T's sentence
+ * splitter (lib/chunker) once it is on main.
  */
-export function firstSentence(text: string): string {
+export function firstSentence(text: string, lang = 'en'): string {
   const start = text.search(/\S/);
   if (start === -1) return '';
   for (let i = start; i < text.length; i++) {
@@ -136,11 +140,11 @@ export function firstSentence(text: string): string {
     if (!/\s/.test(text[j])) continue;
     let k = j;
     while (k < text.length && /\s/.test(text[k])) k++;
-    if (k < text.length && text[k] !== '\n' && !STARTERS.test(text[k])) continue;
+    if (k < text.length && LOWERCASE.test(text[k])) continue;
     if (ch === '.' && j === i + 1) {
-      const tokenStart = text.lastIndexOf(' ', i) + 1;
-      const token = text.slice(Math.max(tokenStart, start), i + 1);
-      if (isAbbreviation(token)) continue;
+      let tokenStart = i;
+      while (tokenStart > start && !/\s/.test(text[tokenStart - 1])) tokenStart--;
+      if (isAbbreviation(text.slice(tokenStart, i + 1), lang)) continue;
     }
     return text.slice(start, j).trim();
   }
@@ -160,7 +164,7 @@ export function loadFixture(meta: FixtureMeta, dir: string = FIXTURES_DIR): Fixt
     text,
     protected: ranges,
     wordCount: countWords(text, meta.lang),
-    firstSentence: meta.firstSentence ?? firstSentence(text),
+    firstSentence: meta.firstSentence ?? firstSentence(text, meta.lang),
     first5Words: firstWords(text, 5, meta.lang),
   };
 }

@@ -8,16 +8,22 @@
 //   Re-running the same command resumes the newest unfinished run of the same
 //   suite whose config hash matches; EVAL_RUN=<id> picks a run, EVAL_FRESH=1
 //   starts a new one. Items whose last line is an error are retried.
+// - Spend is the max of spend.jsonl and the costs in every calls.jsonl, so
+//   deleting spend.jsonl doesn't reset the cap. Calls without usage (timeouts,
+//   aborts) are priced at the estimate. Before each item, the item and all
+//   items in flight are reserved against the cap.
+// - It stops if the upstream reports a different model than the plan priced.
+// - Only one runSuite may run per process.
 // - While items run, globalThis.fetch is replaced by the recorder's guarded
 //   fetch, so engine code is recorded without changes.
 
 import { createHash } from 'node:crypto';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { callCost, estimateCost, formatUsd, type CostEstimate, type TokenEstimate } from './cost';
 import { LiveCallRefused, liveCallsAllowed, type Env } from './guard';
-import { SpendLedger, readCap } from './ledger';
+import { SpendLedger, appendLine, readCap } from './ledger';
 import { createRecorder, type CallRecord } from './record';
 
 export const RESULTS_DIR = fileURLToPath(new URL('../results/', import.meta.url));
@@ -66,7 +72,7 @@ export interface RunOptions<I extends PlanItem> {
   fetchImpl?: typeof fetch;
 }
 
-export type RunStatus = 'dry-run' | 'refused-budget' | 'complete' | 'aborted-budget' | 'incomplete';
+export type RunStatus = 'dry-run' | 'refused-budget' | 'complete' | 'aborted-budget' | 'aborted-model' | 'incomplete';
 
 export interface RunResult {
   status: RunStatus;
@@ -149,16 +155,21 @@ export function selectRun(
   return { runId: newRunId(suite), resumed: false };
 }
 
+const COST_RANK = ['none', 'usage', 'tokens', 'estimate'] as const;
+
+/**
+ * Cost of an item's calls. usage.cost when present; else priced from usage
+ * tokens; else (no usage: timeouts, aborts, errors, non-JSON) the estimate,
+ * because OpenRouter may bill a request the provider had started.
+ */
 function itemCost(item: PlanItem, calls: CallRecord[]): Pick<ItemLine, 'costUsd' | 'costSource'> {
-  if (calls.length === 0) return { costUsd: 0, costSource: 'none' };
+  const sent = calls.filter((c) => !c.refused);
   let usd = 0;
-  let source: ItemLine['costSource'] = 'usage';
-  const rank = { none: 0, usage: 1, tokens: 2, estimate: 3 } as const;
-  const worse = (s: ItemLine['costSource']) => {
-    if (rank[s] > rank[source]) source = s;
+  let source: ItemLine['costSource'] = sent.length ? 'usage' : 'none';
+  const note = (s: ItemLine['costSource']) => {
+    if (COST_RANK.indexOf(s) > COST_RANK.indexOf(source)) source = s;
   };
-  const perCallEstimate = callCost(item.model, item.estimate) / calls.length;
-  for (const c of calls) {
+  for (const c of sent) {
     if (c.usage?.cost !== undefined) {
       usd += c.usage.cost;
     } else if (c.usage?.promptTokens !== undefined || c.usage?.completionTokens !== undefined) {
@@ -166,18 +177,36 @@ function itemCost(item: PlanItem, calls: CallRecord[]): Pick<ItemLine, 'costUsd'
         promptTokens: c.usage.promptTokens ?? 0,
         completionTokens: c.usage.completionTokens ?? 0,
       });
-      worse('tokens');
-    } else if (c.status !== undefined && c.status < 400) {
-      // A successful call without usage: assume the estimate (errs high).
-      usd += perCallEstimate;
-      worse('estimate');
-    } else if (c.status === undefined && !c.error) {
-      usd += perCallEstimate;
-      worse('estimate');
+      note('tokens');
+    } else {
+      usd += callCost(item.model, item.estimate);
+      note('estimate');
     }
   }
   return { costUsd: usd, costSource: source };
 }
+
+/** OpenRouter may echo a dated variant of the slug; anything else means the estimate priced the wrong model. */
+export function sameModel(planned: string, served: string): boolean {
+  return served === planned || served.startsWith(`${planned}-`) || served.startsWith(`${planned}:`);
+}
+
+/** Sum of costUsd over every run's calls.jsonl: a floor for spend if spend.jsonl was deleted. */
+export function recordedSpend(resultsDir: string): number {
+  if (!existsSync(resultsDir)) return 0;
+  let usd = 0;
+  for (const d of readdirSync(resultsDir, { withFileTypes: true })) {
+    if (!d.isDirectory()) continue;
+    for (const l of readLines(path.join(resultsDir, d.name, 'calls.jsonl'))) {
+      if (Number.isFinite(l.costUsd)) usd += l.costUsd;
+    }
+  }
+  return usd;
+}
+
+// One runSuite per process: it swaps globalThis.fetch, so two at once would
+// misattribute calls and restore the wrong fetch.
+let active = false;
 
 async function pool<T>(items: T[], concurrency: number, worker: (item: T) => Promise<boolean>): Promise<void> {
   let next = 0;
@@ -192,6 +221,16 @@ async function pool<T>(items: T[], concurrency: number, worker: (item: T) => Pro
 }
 
 export async function runSuite<I extends PlanItem>(opts: RunOptions<I>): Promise<RunResult> {
+  if (active) throw new Error('runSuite is already running in this process; run suites one after another.');
+  active = true;
+  try {
+    return await runSuiteInner(opts);
+  } finally {
+    active = false;
+  }
+}
+
+async function runSuiteInner<I extends PlanItem>(opts: RunOptions<I>): Promise<RunResult> {
   const env = opts.env ?? process.env;
   const log = opts.log ?? ((line: string) => console.log(line));
   const resultsDir = opts.resultsDir ?? RESULTS_DIR;
@@ -205,7 +244,7 @@ export async function runSuite<I extends PlanItem>(opts: RunOptions<I>): Promise
   }
 
   const estimate = estimateCost(opts.items.map((i) => ({ model: i.model, ...i.estimate })));
-  const ledgerBefore = ledger.spent();
+  const ledgerBefore = Math.max(ledger.spent(), recordedSpend(resultsDir));
   const base = { estimate, lines: [] as ItemLine[], spentUsd: 0, capUsd };
 
   log(`Suite ${opts.suite}: ${opts.items.length} items, ~${estimate.promptTokens} prompt + ~${estimate.completionTokens} completion tokens.`);
@@ -216,7 +255,7 @@ export async function runSuite<I extends PlanItem>(opts: RunOptions<I>): Promise
   log(`Eval ledger so far: ${formatUsd(ledgerBefore)} of ${formatUsd(capUsd)} cap (EVAL_MAX_USD).`);
 
   if (!liveCallsAllowed(env)) {
-    log('Dry run: no calls made. Re-run with EVAL=1 EVAL_YES=1 to execute.');
+    log('Dry run: no calls made. Re-run with EVAL=1 EVAL_YES=1 (in the shell) via `npm run eval` to execute.');
     return { ...base, status: 'dry-run', ledgerUsd: ledgerBefore };
   }
 
@@ -253,36 +292,48 @@ export async function runSuite<I extends PlanItem>(opts: RunOptions<I>): Promise
   const previousFetch = globalThis.fetch;
   globalThis.fetch = recorder.fetch;
   let spentUsd = 0;
+  let finished = 0;
+  let inFlight = 0;
   let abortedBudget = false;
+  let modelMismatch: string | undefined;
   let refused: LiveCallRefused | undefined;
+  // Never below what this process has seen, even if spend.jsonl is deleted mid-run.
+  const spentNow = () => Math.max(ledger.spent(), ledgerBefore + spentUsd);
 
   try {
     await pool(pending, opts.concurrency ?? 1, async (item) => {
-      if (ledger.spent() >= capUsd) {
+      // Reserve this item and every item in flight at max(estimate, average actual so far).
+      const reserve = Math.max(callCost(item.model, item.estimate), finished ? spentUsd / finished : 0);
+      if (spentNow() + (inFlight + 1) * reserve > capUsd) {
         abortedBudget = true;
         return false;
       }
-      const { value, error, calls } = await recorder.capture(() => opts.execute(item));
+      inFlight++;
+      const { value, error, calls } = await recorder.capture(() => opts.execute(item)).finally(() => inFlight--);
       const cost = itemCost(item, calls);
-      if (error instanceof LiveCallRefused || calls.some((c) => c.refused)) {
-        refused = error instanceof LiveCallRefused ? error : new LiveCallRefused(calls.find((c) => c.refused)!.url);
-        return false;
+      const refusedCall = calls.find((c) => c.refused);
+      if (error instanceof LiveCallRefused || refusedCall) {
+        refused = error instanceof LiveCallRefused ? error : new LiveCallRefused(refusedCall!.url);
       }
+      const wrongModel = calls.find((c) => c.model && !sameModel(item.model, c.model));
+      if (wrongModel) modelMismatch = `planned ${item.model}, served ${wrongModel.model}`;
       const line: ItemLine = {
         key: item.key,
-        status: error === undefined ? 'ok' : 'error',
+        status: error === undefined && !refused && !wrongModel ? 'ok' : 'error',
         ...(error === undefined
           ? { value }
           : { error: error instanceof Error ? error.message : String(error) }),
+        ...(wrongModel ? { error: `model mismatch: ${modelMismatch}` } : {}),
         calls,
         ...cost,
         ts: new Date().toISOString(),
       };
-      appendFileSync(callsFile, JSON.stringify(line) + '\n');
+      appendLine(callsFile, JSON.stringify(line));
       if (cost.costUsd > 0) ledger.record({ runId, key: item.key, usd: cost.costUsd });
       spentUsd += cost.costUsd;
+      finished++;
       done.set(item.key, line);
-      return true;
+      return !refused && !modelMismatch;
     });
   } finally {
     globalThis.fetch = previousFetch;
@@ -292,9 +343,16 @@ export async function runSuite<I extends PlanItem>(opts: RunOptions<I>): Promise
   const lines = opts.items.map((i) => done.get(i.key)).filter((l): l is ItemLine => !!l);
   const complete = lines.length === opts.items.length && lines.every((l) => l.status === 'ok');
   if (complete) writeMeta(dir, { ...meta, finished: true });
-  const status: RunStatus = complete ? 'complete' : abortedBudget ? 'aborted-budget' : 'incomplete';
-  const ledgerUsd = ledger.spent();
+  const status: RunStatus = complete
+    ? 'complete'
+    : modelMismatch
+      ? 'aborted-model'
+      : abortedBudget
+        ? 'aborted-budget'
+        : 'incomplete';
+  const ledgerUsd = spentNow();
   log(`Run ${runId}: ${status}; spent ${formatUsd(spentUsd)} this session, ledger ${formatUsd(ledgerUsd)}.`);
   if (abortedBudget) log('Stopped at the EVAL_MAX_USD cap. Re-run the same command after raising it to resume.');
+  if (modelMismatch) log(`Stopped: ${modelMismatch}. Plan items with the model the engine actually uses (evalModel()).`);
   return { status, estimate, runId, dir, lines, spentUsd, ledgerUsd, capUsd };
 }

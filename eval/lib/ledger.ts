@@ -4,9 +4,10 @@
 // spent. Appends are small single writes (O_APPEND), so two processes don't
 // clobber each other, and every check re-reads the file, so the EVAL_MAX_USD
 // cap holds across suites and across runs. The cap is cumulative: to allow
-// more spend, raise EVAL_MAX_USD or move spend.jsonl aside.
+// more spend, raise EVAL_MAX_USD. Deleting spend.jsonl does not reset it: the
+// runner also sums the costs in every results/<runId>/calls.jsonl.
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
 import path from 'node:path';
 import type { Env } from './guard';
 
@@ -49,7 +50,26 @@ export class SpendLedger {
   }
 
   record(entry: Omit<LedgerEntry, 'ts'>): void {
-    mkdirSync(path.dirname(this.file), { recursive: true });
-    appendFileSync(this.file, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + '\n');
+    appendLine(this.file, JSON.stringify({ ts: new Date().toISOString(), ...entry }));
   }
+}
+
+/** Appends one JSONL line, starting a new line first if a killed writer left a torn one. */
+export function appendLine(file: string, line: string): void {
+  mkdirSync(path.dirname(file), { recursive: true });
+  let prefix = '';
+  if (existsSync(file)) {
+    const size = statSync(file).size;
+    if (size > 0) {
+      const fd = openSync(file, 'r');
+      try {
+        const last = Buffer.alloc(1);
+        readSync(fd, last, 0, 1, size - 1);
+        if (last[0] !== 0x0a) prefix = '\n';
+      } finally {
+        closeSync(fd);
+      }
+    }
+  }
+  appendFileSync(file, prefix + line + '\n');
 }

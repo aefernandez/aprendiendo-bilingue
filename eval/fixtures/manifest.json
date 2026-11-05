@@ -62,10 +62,10 @@
     "file": "en-torture.txt",
     "lang": "en",
     "genre": "social",
-    "words": 140,
+    "words": 150,
     "nativeChecked": false,
     "torture": true,
-    "notes": "TORTURE (not natural prose): contractions, O'Brien, dogs', well-known, e-mail, Mr./Dr./U.S./Jan./St., a.m., $ and %, 1,250, URL with query, email, @handle, #tag, emoji, curly quotes, NBSP, 'I met Tom. He left.', 'We visited the US. It was big.', repeated 'come'."
+    "notes": "TORTURE (not natural prose): contractions, O'Brien, dogs', well-known, e-mail, Mr./Dr./U.S./Jan./St., a.m., $ and %, 1,250, URL with query, email, @handle, #tag, emoji, curly quotes, NBSP, 'so did I. We', 'I met Tom. He left.', 'We visited the US. It was big.', repeated 'come'."
   },
   {
     "id": "en-recipe-1",
@@ -147,10 +147,10 @@
     "file": "es-torture.txt",
     "lang": "es",
     "genre": "social",
-    "words": 140,
+    "words": 150,
     "nativeChecked": false,
     "torture": true,
-    "notes": "TORTURE (not natural prose): Sr./Sra./Ayto./EE. UU./p. ej./a. m., 2º, 4.º, 1.000, 3,5, 10:30h, 3años, dámelo, del/al, ¿¡, curly quotes, NBSP, emoji, URL with query, email, @handle, #tag, 'Yo sí. Luego', repeated 'come', NFD accents in 'cafetería'."
+    "notes": "TORTURE (not natural prose): Sr./Sra./Ayto./EE. UU./p. ej./a. m., 2º, 4.º, 1.000, 3,50, 10:30h, 3años, dámelo, del/al, ¿¡, «», raya dialogue on separate lines, curly quotes, NBSP, U+202F, emoji, URL with query, email, @handle, #tag, 'Yo sí. Luego', repeated 'come', NFD accents in 'cafetería'."
   },
   {
     "id": "es-recipe-1",

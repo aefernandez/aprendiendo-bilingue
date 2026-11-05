@@ -2,10 +2,11 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { callCost, estimateCost, estimateTokens } from './cost';
+import { swap } from '../../lib/swapEngine';
+import { callCost, estimateCost, estimateTokens, evalModel } from './cost';
 import { buildEvalEnv, selectSuite, suiteFilters } from './evalConfig';
-import { LiveCallRefused, assertLiveCallsAllowed, liveCallsAllowed } from './guard';
-import { SpendLedger, readCap } from './ledger';
+import { APP_KEY_HASHES_VAR, LiveCallRefused, assertLiveCallsAllowed, guardFetch, liveCallsAllowed, sha256 } from './guard';
+import { SpendLedger, appendLine, readCap } from './ledger';
 import { createRecorder, readResponseFields } from './record';
 import { readLines, runSuite, type PlanItem } from './run';
 import { renderSummary, writeSummary, type Summary } from './summary';
@@ -13,7 +14,7 @@ import { installThrowingFetch, throwingFetch } from './testing';
 
 installThrowingFetch();
 
-const LIVE = { EVAL: '1', EVAL_YES: '1' };
+const LIVE = { EVAL: '1', EVAL_YES: '1', EVAL_HARNESS: '1' };
 const MODEL = 'google/gemma-4-26b-a4b-it';
 
 let dir: string;
@@ -58,7 +59,8 @@ describe('live-call guard', () => {
     [{}, false],
     [{ EVAL: '1' }, false],
     [{ EVAL_YES: '1' }, false],
-    [{ EVAL: 'true', EVAL_YES: '1' }, false],
+    [{ EVAL: 'true', EVAL_YES: '1', EVAL_HARNESS: '1' }, false],
+    [{ EVAL: '1', EVAL_YES: '1' }, false], // root run: no EVAL_HARNESS, never live
     [LIVE, true],
   ])('%j → %s', (env, allowed) => {
     expect(liveCallsAllowed(env)).toBe(allowed);
@@ -89,6 +91,11 @@ describe('ledger', () => {
     new SpendLedger(file).record({ runId: 'r2', key: 'b', usd: 0.5 }); // another process
     writeFileSync(file, readFileSync(file, 'utf8') + '{"usd": 9');
     expect(ledger.spent()).toBeCloseTo(0.75);
+    // The next append must not land on the torn line.
+    ledger.record({ runId: 'r3', key: 'c', usd: 1.5 });
+    expect(ledger.spent()).toBeCloseTo(2.25);
+    appendLine(path.join(dir, 'new.jsonl'), '{}');
+    expect(readFileSync(path.join(dir, 'new.jsonl'), 'utf8')).toBe('{}\n');
     expect(readCap({})).toBe(2);
     expect(readCap({ EVAL_MAX_USD: '0.5' })).toBe(0.5);
     expect(() => readCap({ EVAL_MAX_USD: 'lots' })).toThrow();
@@ -235,28 +242,83 @@ describe('runSuite', () => {
     const inner = vi.fn<typeof fetch>(async () => completion(0.6)); // actual cost far above the estimate
     const r = await runSuite(base({ env: { ...LIVE, EVAL_MAX_USD: '1' }, fetchImpl: inner, items: items(5) }));
     expect(r.status).toBe('aborted-budget');
-    expect(inner).toHaveBeenCalledTimes(2);
-    expect(r.ledgerUsd).toBeCloseTo(1.2);
+    // After the first item the $0.60 average is reserved for the next one: 0.6 + 0.6 > 1.
+    expect(inner).toHaveBeenCalledTimes(1);
+    expect(r.ledgerUsd).toBeCloseTo(0.6);
   });
 
-  it('stops and throws if engine code swallows a refused call', async () => {
+  it('stops and throws if engine code swallows a refusal from the worker guard', async () => {
+    // The runner's options say live, but the worker-wide guard (eval/setup.ts)
+    // reads a non-live process env and refuses; the engine swallows the error.
+    const inner = vi.fn<typeof fetch>();
     const execute = async () => {
-      await new Promise((r) => setTimeout(r, 0)); // let the test flip EVAL_YES first
       try {
         await fetch('https://openrouter.ai/api/v1/chat/completions');
       } catch {
         return { degraded: true }; // like swap() falling back
       }
     };
-    // Force the runner past its own dry-run check, while the recorder still sees no EVAL_YES.
-    const env: Record<string, string> = { ...LIVE };
-    const inner = vi.fn<typeof fetch>(async () => {
-      throw new Error('unreachable');
-    });
-    const run = runSuite(base({ env, fetchImpl: inner, execute }));
-    env.EVAL_YES = '0';
+    const run = runSuite(base({ env: LIVE, fetchImpl: guardFetch(inner, {}), execute }));
     await expect(run).rejects.toBeInstanceOf(LiveCallRefused);
     expect(inner).not.toHaveBeenCalled();
+  });
+
+  it('prices calls that errored or timed out without usage at the estimate', async () => {
+    const inner = vi.fn<typeof fetch>(async () => {
+      throw new DOMException('The operation was aborted.', 'TimeoutError');
+    });
+    const r = await runSuite(base({ env: LIVE, fetchImpl: inner, items: items(1) }));
+    expect(r.lines[0]).toMatchObject({ status: 'error', costSource: 'estimate' });
+    expect(r.lines[0].costUsd).toBeCloseTo(callCost(MODEL, { promptTokens: 1000, completionTokens: 200 }));
+    expect(new SpendLedger(path.join(dir, 'spend.jsonl')).spent()).toBeCloseTo(r.lines[0].costUsd);
+  });
+
+  it('keeps the cap when spend.jsonl is deleted mid-run or between runs', async () => {
+    const ledgerFile = path.join(dir, 'spend.jsonl');
+    const inner = vi.fn<typeof fetch>(async () => {
+      rmSync(ledgerFile, { force: true });
+      return completion(0.4);
+    });
+    const r = await runSuite(base({ env: { ...LIVE, EVAL_MAX_USD: '1' }, fetchImpl: inner, items: items(5) }));
+    expect(r.status).toBe('aborted-budget');
+    expect(inner).toHaveBeenCalledTimes(2); // $0.80 spent; a third $0.40 item would pass $1
+    rmSync(ledgerFile, { force: true });
+    const again = await runSuite(base({ env: { ...LIVE, EVAL_MAX_USD: '0.8001', EVAL_FRESH: '1' }, fetchImpl: inner }));
+    expect(again.status).toBe('refused-budget'); // floor from calls.jsonl: $0.80 + estimate > $0.8001
+  });
+
+  it('reserves in-flight items against the cap', async () => {
+    const inner = vi.fn<typeof fetch>(async () => {
+      await new Promise((r) => setTimeout(r, 5));
+      return completion(0.6);
+    });
+    const r = await runSuite(base({ env: { ...LIVE, EVAL_MAX_USD: '1' }, fetchImpl: inner, items: items(20), concurrency: 8 }));
+    expect(r.status).toBe('aborted-budget');
+    // 8 start at the (tiny) estimate; after that the $0.60 average is reserved, so nothing more starts.
+    expect(inner).toHaveBeenCalledTimes(8);
+    expect(r.ledgerUsd).toBeCloseTo(4.8);
+  });
+
+  it('stops when the upstream serves a different model than the plan priced', async () => {
+    const inner = vi.fn<typeof fetch>(async () => completion(0.001, { model: 'anthropic/claude-opus-5' }));
+    const r = await runSuite(base({ env: LIVE, fetchImpl: inner }));
+    expect(r.status).toBe('aborted-model');
+    expect(inner).toHaveBeenCalledTimes(1);
+    expect(r.lines[0].error).toMatch(/model mismatch/);
+  });
+
+  it('refuses a second runSuite in the same process', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const inner = vi.fn<typeof fetch>(async () => {
+      await gate;
+      return completion(0);
+    });
+    const first = runSuite(base({ env: LIVE, fetchImpl: inner, items: items(1) }));
+    await expect(runSuite(base({ env: LIVE, fetchImpl: inner, suite: 'other' }))).rejects.toThrow(/already running/);
+    release();
+    expect((await first).status).toBe('complete');
+    expect(globalThis.fetch).toBe(throwingFetch);
   });
 
   it('rejects duplicate keys', async () => {
@@ -313,6 +375,7 @@ describe('eval config', () => {
     expect(suiteFilters(['run', '--config', 'eval/vitest.config.ts', 'baseline'])).toEqual(['baseline']);
     expect(suiteFilters(['run', '--config=eval/vitest.config.ts'])).toEqual([]);
     expect(suiteFilters(['run', '-c', 'x', 'a', 'b', '--silent'])).toEqual(['a', 'b']);
+    expect(suiteFilters(['run', '--bail', '1', 'baseline'])).toEqual(['baseline']);
   });
 
   it('requires exactly one suite matching exactly one file', () => {
@@ -326,22 +389,106 @@ describe('eval config', () => {
     expect(() => selectSuite(['x'], [], root)).toThrow(/\(none yet\)/);
   });
 
-  it('takes EVAL flags from the shell only and uses the separate eval key', () => {
-    const env = buildEvalEnv(
-      { EVAL: '1', EVAL_YES: '1', LLM_API_KEY: 'app-key', EVAL_LLM_API_KEY: 'eval-key', LLM_MODEL: 'm' },
-      { OPENROUTER_API_KEY: 'old-app-key', EVAL_MAX_USD: '1' },
-    );
-    expect(env.EVAL).toBe('');
-    expect(env.EVAL_YES).toBe('');
-    expect(env.LLM_API_KEY).toBe('eval-key');
-    expect(env.OPENROUTER_API_KEY).toBe('');
-    expect(env.LLM_MODEL).toBe('m');
-    expect(env.EVAL_MAX_USD).toBe('1');
-    expect(buildEvalEnv({ LLM_API_KEY: 'app-key' }, { EVAL: '1', EVAL_YES: '1' })).toMatchObject({
+  const files = {
+    EVAL: '1',
+    EVAL_YES: '1',
+    EVAL_MAX_USD: '9999',
+    LLM_API_KEY: 'app-key',
+    EVAL_LLM_API_KEY: 'eval-key',
+    LLM_MODEL: 'anthropic/claude-opus-5',
+    LLM_BASE_URL: 'https://pricey.example.com/v1',
+    LLM_STRUCTURED_OUTPUTS: 'false',
+  };
+
+  it('ignores EVAL, EVAL_YES, EVAL_MAX_USD, model and base URL from .env files', () => {
+    const env = buildEvalEnv(files, { OPENROUTER_API_KEY: 'old-app-key' });
+    expect(env).toMatchObject({
+      EVAL: '',
+      EVAL_YES: '',
+      EVAL_MAX_USD: '',
+      EVAL_HARNESS: '1',
+      LLM_API_KEY: '', // not live: no key at all, not even the eval key
+      EVAL_LLM_API_KEY: '',
+      OPENROUTER_API_KEY: '',
+      LLM_MODEL: '',
+      LLM_BASE_URL: '',
+      LLM_STRUCTURED_OUTPUTS: 'false',
+    });
+    expect(env[APP_KEY_HASHES_VAR].split(',').sort()).toEqual([sha256('app-key'), sha256('old-app-key')].sort());
+    expect(JSON.stringify(env)).not.toMatch(/app-key|eval-key/);
+  });
+
+  it('passes the eval key, cap, model and base URL only from a live shell', () => {
+    const env = buildEvalEnv(files, {
       EVAL: '1',
       EVAL_YES: '1',
-      LLM_API_KEY: '',
+      EVAL_MAX_USD: '1',
+      EVAL_LLM_MODEL: 'google/gemma-4-26b-a4b-it',
+      LLM_API_KEY: 'shell-app-key',
     });
+    expect(env).toMatchObject({ EVAL: '1', EVAL_YES: '1', EVAL_MAX_USD: '1', LLM_API_KEY: 'eval-key', LLM_MODEL: 'google/gemma-4-26b-a4b-it', LLM_BASE_URL: '' });
+    expect(env[APP_KEY_HASHES_VAR].split(',')).toContain(sha256('shell-app-key'));
+    expect(evalModel(env)).toBe('google/gemma-4-26b-a4b-it');
+    expect(evalModel(buildEvalEnv(files, {}))).toBe(MODEL);
+  });
+});
+
+describe('app keys are unusable (direct swap() calls)', () => {
+  const TEXT = 'The dog runs home. The cat sleeps all day.';
+  const files = { LLM_API_KEY: 'app-key', OPENROUTER_API_KEY: 'app-key-2', EVAL_LLM_API_KEY: 'eval-key' };
+
+  function applyEnv(env: Record<string, string>) {
+    for (const [k, v] of Object.entries(env)) vi.stubEnv(k, v);
+  }
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  const bearers = (inner: ReturnType<typeof vi.fn<typeof fetch>>) =>
+    inner.mock.calls.map((c) => new Headers(c[1]?.headers).get('authorization'));
+
+  it('eval worker, dry-run shell: swap() sends nothing', async () => {
+    applyEnv(buildEvalEnv(files, {}));
+    const inner = vi.fn<typeof fetch>(async () => completion(0));
+    vi.stubGlobal('fetch', guardFetch(inner)); // what eval/setup.ts installs
+    const result = await swap(TEXT, 1);
+    expect(result.degraded).toBe(true);
+    expect(inner).not.toHaveBeenCalled();
+  });
+
+  it('eval worker, live shell with an app key exported: swap() uses only the eval key', async () => {
+    applyEnv(buildEvalEnv(files, { EVAL: '1', EVAL_YES: '1', LLM_API_KEY: 'shell-app-key' }));
+    const inner = vi.fn<typeof fetch>(async () => completion(0));
+    vi.stubGlobal('fetch', guardFetch(inner));
+    await swap(TEXT, 1);
+    expect(inner).toHaveBeenCalled();
+    expect(new Set(bearers(inner))).toEqual(new Set(['Bearer eval-key']));
+  });
+
+  it('eval worker, live shell: a request carrying an app key is refused', async () => {
+    applyEnv(buildEvalEnv(files, { EVAL: '1', EVAL_YES: '1' }));
+    vi.stubEnv('LLM_API_KEY', 'app-key'); // e.g. code that re-reads .env.local itself
+    const inner = vi.fn<typeof fetch>(async () => completion(0));
+    vi.stubGlobal('fetch', guardFetch(inner));
+    const result = await swap(TEXT, 1);
+    expect(result.degraded).toBe(true);
+    expect(inner).not.toHaveBeenCalled();
+  });
+
+  it('root run, live-looking shell with the app key: the harness stays a dry run', async () => {
+    applyEnv({ EVAL: '1', EVAL_YES: '1', LLM_API_KEY: 'app-key' }); // no EVAL_HARNESS
+    const inner = vi.fn<typeof fetch>(async () => completion(0));
+    const execute = vi.fn(async () => swap(TEXT, 1));
+    const r = await runSuite({ suite: 's', config: {}, items: items(1), execute, resultsDir: dir, log: () => {}, fetchImpl: inner });
+    expect(r.status).toBe('dry-run');
+    expect(execute).not.toHaveBeenCalled();
+    expect(inner).not.toHaveBeenCalled();
+  });
+
+  it('root run: a direct swap() in an eval unit test hits the throwing fetch', async () => {
+    applyEnv({ LLM_API_KEY: 'app-key' });
+    const result = await swap(TEXT, 1);
+    expect(result.degraded).toBe(true); // nothing left the process: the global fetch throws
   });
 });
 
