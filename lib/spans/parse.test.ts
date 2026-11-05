@@ -30,7 +30,24 @@ describe('parseItems (substring format)', () => {
   it('treats an explicit empty list as success', () => {
     expect(parseItems('<Think>x</Think>{"i":[]}')!.items).toEqual([]);
     expect(parseItems('Answer: {"i": []} extra')!.items).toEqual([]);
-    expect(parseItems('I found none: []')!.items).toEqual([]);
+    expect(parseItems('[]')!.items).toEqual([]);
+    expect(parseItems('Example from prompt: ["El perro","The dog","n"]\n{"i":[]}')!.items).toEqual([]);
+  });
+
+  it('treats a refusal with a stray [] as a failure', () => {
+    expect(parseItems('I cannot do that []')).toBeNull();
+    expect(parseItems('none []')).toBeNull();
+    expect(parseItems('I found none: []')).toBeNull();
+  });
+
+  it('salvages only inside the item list', () => {
+    const p = parseItems('{"note":["x","y","z"],"i":[["a","b","n"],["c","d","v"]], "x":[["e","f","n"]] junk');
+    expect(p!.items).toEqual([['a', 'b', 'n'], ['c', 'd', 'v']]);
+    expect(parseItems('Example: ["El perro","The dog","n"] then nothing')).toBeNull();
+  });
+
+  it('wraps a single bare tuple', () => {
+    expect(parseItems('["a","b","n"]')!.items).toEqual([['a', 'b', 'n']]);
   });
 
   it('ignores prose brackets and returns null for garbage', () => {

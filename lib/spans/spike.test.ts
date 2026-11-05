@@ -38,7 +38,9 @@ describe('spike replies (substring format)', () => {
       received += r.stats.received;
       kept += r.stats.kept;
       expect(r.stats.dropped).toEqual({});
-      expect(r.stats.aligned).toEqual({ exact: r.stats.received, case: 0, backtrack: 0, jump: 0 });
+      // No fallbacks: every item is found forward in order (same sentence, or the next one).
+      expect(r.stats.aligned.case + r.stats.aligned.backtrack).toBe(0);
+      expect(r.stats.aligned.exact + r.stats.aligned.next).toBe(r.stats.received);
       for (const k of r.kept) expect(p.text.slice(k.start, k.end)).toBe(k.source);
       expect(coverage(tokens, r.kept)).toBeGreaterThan(0.5);
     });

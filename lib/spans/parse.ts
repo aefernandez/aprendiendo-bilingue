@@ -25,11 +25,11 @@ function stripWrappers(content: string): string {
     .trim();
 }
 
-/** Nested bracket scanner: every complete inner array of the item list. */
-function scanBrackets(text: string): unknown[] {
-  const key = text.search(/"i"\s*:\s*\[/);
-  const open = key >= 0 ? text.indexOf('[', key) : text.search(/\[\s*\[/);
-  if (open < 0) return [];
+/**
+ * Nested bracket scanner over the item list that opens at `open`: every
+ * complete inner array, plus where the list closed (or the text ended).
+ */
+function scanBrackets(text: string, open: number): { items: unknown[]; close: number } {
   const items: unknown[] = [];
   let depth = 0;
   let inStr = false;
@@ -48,7 +48,7 @@ function scanBrackets(text: string): unknown[] {
       if (depth === 0) elemStart = k;
       depth++;
     } else if (ch === ']') {
-      if (depth === 0) break;
+      if (depth === 0) return { items, close: k };
       depth--;
       if (depth === 0 && elemStart >= 0) {
         try {
@@ -60,13 +60,13 @@ function scanBrackets(text: string): unknown[] {
       }
     }
   }
-  return items;
+  return { items, close: text.length };
 }
 
 /** Flat per-item salvage: survives broken nesting (e.g. pos written as `["n"` unclosed). */
-function scanItems(text: string): unknown[] {
+function scanItems(region: string): unknown[] {
   const out: unknown[] = [];
-  for (const m of text.matchAll(ITEM_RE)) {
+  for (const m of region.matchAll(ITEM_RE)) {
     try {
       const item: unknown[] = [JSON.parse(m[1]), JSON.parse(m[2])];
       if (m[3] !== undefined) item.push(JSON.parse(m[3]));
@@ -78,29 +78,38 @@ function scanItems(text: string): unknown[] {
   return out;
 }
 
+const isTuple = (v: unknown[]) => v.length >= 2 && v.every(x => !Array.isArray(x) || x.length <= 1) && typeof v[0] === 'string' && typeof v[1] === 'string';
+
 /**
  * Strips `<think>` blocks (any case) and code fences, then:
- * 1. JSON.parse, accepting `{"i":[…]}` or a bare array;
- * 2. else the bracket scanner and the flat per-item regex, keeping whichever
- *    recovers more items;
- * 3. else an explicit empty list (`"i": []` or a bare `[]`) is an empty success.
- * Returns null when nothing usable is found (garbage, or an unclosed `<think>`).
+ * 1. JSON.parse, accepting `{"i":[…]}`, a bare list, or a single bare tuple;
+ * 2. an explicit `"i": []` anywhere is an empty success;
+ * 3. else salvage, only inside the item list (after `"i":[`, or from the first
+ *    `[[` when there is no key) and only up to where that list closes: the
+ *    bracket scanner and the flat per-item regex, keeping whichever recovers
+ *    more. Echoed prose (`Example: ["El perro","The dog","n"]`) and other keys
+ *    never become items;
+ * 4. a bare `[]` is an empty success only when it is the whole reply.
+ * Returns null otherwise (garbage, a refusal like "I cannot do that []", or an
+ * unclosed `<think>`) so the chunk can be retried.
  */
 export function parseItems(content: string): ParsedItems | null {
   const text = stripWrappers(content);
   try {
     const v: unknown = JSON.parse(text);
+    if (Array.isArray(v) && isTuple(v)) return { items: [v], truncated: false, method: 'json' };
     const arr = Array.isArray(v) ? v : v && typeof v === 'object' ? (v as { i?: unknown }).i : undefined;
     if (Array.isArray(arr)) return { items: arr, truncated: false, method: 'json' };
   } catch {
     // fall through to salvage
   }
-  const bracketed = scanBrackets(text);
-  const flat = scanItems(text);
+  if (/"i"\s*:\s*\[\s*\]/.test(text)) return { items: [], truncated: false, method: 'json' };
+  const key = text.search(/"i"\s*:\s*\[/);
+  const open = key >= 0 ? text.indexOf('[', key) : text.search(/\[\s*\[/);
+  if (open < 0) return null;
+  const { items: bracketed, close } = scanBrackets(text, open);
+  const flat = scanItems(text.slice(open, close + 1));
   if (flat.length > bracketed.length) return { items: flat, truncated: true, method: 'regex' };
   if (bracketed.length) return { items: bracketed, truncated: true, method: 'brackets' };
-  if (/"i"\s*:\s*\[\s*\]/.test(text) || /(?:^|[\s:])\[\s*\](?=\s*$|\s*[.!]?\s*$)/.test(text)) {
-    return { items: [], truncated: false, method: 'json' };
-  }
   return null;
 }

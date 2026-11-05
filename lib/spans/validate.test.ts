@@ -26,7 +26,7 @@ describe('alignment', () => {
   it('aligns in order and returns absolute offsets', () => {
     const r = run(T, 'es', [['come pan', 'mangia pane', 'v'], ['bebe agua', 'beve acqua', 'v'], ['come fruta', 'mangia frutta', 'v']], 'Luego');
     expect(r.kept.map(k => [k.source, k.start, k.end, k.how])).toEqual([
-      ['come pan', 5, 13, 'exact'], ['bebe agua', 16, 25, 'exact'], ['come fruta', 33, 43, 'exact'],
+      ['come pan', 5, 13, 'exact'], ['bebe agua', 16, 25, 'exact'], ['come fruta', 33, 43, 'next'],
     ]);
   });
 
@@ -51,7 +51,7 @@ describe('alignment', () => {
   });
 
   it('falls back to a case-insensitive match (sentence-initial capital)', () => {
-    const r = run('El perro come.', 'es', [['el perro', 'il cane', 'n']]);
+    const r = run('El perro come.', 'es', [['el perro', 'Il cane', 'n']]);
     expect(r.kept.map(k => [k.source, k.how])).toEqual([['El perro', 'case']]);
   });
 
@@ -62,7 +62,7 @@ describe('alignment', () => {
     expect(run('Esta casa está lejos.', 'es', [['está', 'è', 'v']]).kept[0].start).toBe(10);
     expect(run('Sí, si quieres.', 'es', [['si', 'se', 'c']]).kept[0].start).toBe(4);
     expect(run('Tú y tu perro.', 'es', [['tu', 'il tuo', 'd']]).kept[0].start).toBe(5);
-    expect(run('Te doy té.', 'es', [['te', 'ti', 'p'], ['té', 'tè', 'n']]).kept.map(k => [k.source, k.start])).toEqual([['Te', 0], ['té', 7]]);
+    expect(run('Te doy té.', 'es', [['te', 'Ti', 'p'], ['té', 'tè', 'n']]).kept.map(k => [k.source, k.start])).toEqual([['Te', 0], ['té', 7]]);
     expect(run('Él come.', 'es', [['el', 'lui', 'p']]).stats.dropped).toEqual({ align: 1 });
   });
 
@@ -81,7 +81,7 @@ describe('alignment', () => {
 
   it('never aligns across a sentence boundary', () => {
     const r = run(T, 'es', [['agua. Luego', 'acqua. Poi', 'x']], 'Luego');
-    expect(r.stats.dropped).toEqual({ sentence: 1 });
+    expect(r.stats.dropped).toEqual({ align: 1 });
   });
 
   it('never aligns into or across a masked URL, email or domain', () => {
@@ -115,19 +115,21 @@ describe('alignment', () => {
 });
 
 describe('item checks', () => {
-  it('accepts pos wrapped as ["n"] and drops unknown or missing pos', () => {
-    const r = run(T, 'es', [['Juan', 'Gianni', ['n']], ['come', 'mangia', 'q'], ['pan', 'pane'], ['agua', 'acqua', 'N']], 'Luego');
-    expect(r.kept.map(k => [k.source, k.pos])).toEqual([['Juan', 'n'], ['agua', 'n']]);
+  it('accepts pos wrapped as ["n"] or as a long name, keeps a missing pos, drops an unknown one', () => {
+    const r = run(T, 'es', [['Juan', 'Gianni', ['n']], ['come', 'mangia', 'q'], ['pan', 'pane'], ['bebe', 'beve', 'verb'], ['agua', 'acqua', 'N']], 'Luego');
+    expect(r.kept.map(k => [k.source, k.pos])).toEqual([['Juan', 'n'], ['pan', undefined], ['bebe', 'v'], ['agua', 'n']]);
     expect(r.stats.posWrapped).toBe(1);
-    expect(r.stats.dropped).toEqual({ pos: 2 });
+    expect(r.stats.dropped).toEqual({ pos: 1 });
   });
 
   it('drops items whose translation is a POS tag', () => {
     const r = run('El perro come pan. Es un problema grave.', 'es', [
-      ['perro', 'n'], ['come', 'v', 'v'], ['problema grave', 'ADJ', 'n'], ['pan', 'noun', 'n'],
+      ['perro', 'n'], ['come', 'v', 'v'], ['pan', 'noun', 'q'], ['problema grave', 'ADJ', 'n'],
     ], 'Es un');
     expect(r.kept).toEqual([]);
     expect(r.stats.dropped).toEqual({ posAsTranslation: 4 });
+    // Real words that happen to be tag names are fine when the pos slot is valid.
+    expect(src(run('Una expresión y un verbo.', 'es', [['expresión', 'expression', 'n'], ['verbo', 'verb', 'n']]))).toEqual(['expresión', 'verbo']);
     // A POS-code letter can be a real word: Italian "e" for "y".
     expect(src(run(T, 'es', [['y', 'e', 'c']], 'Luego'))).toEqual(['y']);
   });

@@ -79,7 +79,9 @@ describe('span invariants (property)', () => {
       for (const k of [...kept, ...cleanRes.kept]) {
         if (k.start < range.start || k.end > range.end) v.outOfRange++;
         if (text.slice(k.start, k.end) !== k.source) v.sourceMismatch++;
-        if (tokens.some(t => (t.start < k.start && k.start < t.end) || (t.start < k.end && k.end < t.end))) {
+        // A span may stop before a trailing possessive apostrophe ("dogs" in dogs').
+        const cutEnd = (t: { start: number; end: number }) => t.start < k.end && k.end < t.end && !(t.end === k.end + 1 && /['’]/.test(text[k.end]));
+        if (tokens.some(t => (t.start < k.start && k.start < t.end) || cutEnd(t))) {
           v.cutsToken++;
           examples.cutsToken ??= JSON.stringify([text, k.source]);
         }
