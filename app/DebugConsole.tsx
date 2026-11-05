@@ -22,6 +22,9 @@ export const DEBUG_CONSOLE_ENABLED = debugConsoleEnabled();
 
 const MAX_EVENTS = 200;
 let events: DebugEvent[] = [];
+// Hidden by the user with the close button. The next new error shows the
+// console again, so a hidden console never hides a fresh problem.
+let hidden = false;
 const listeners = new Set<() => void>();
 
 function emit() {
@@ -35,6 +38,12 @@ export function logDebug(input: DebugEvent | DebugEvent[]) {
   const added = Array.isArray(input) ? input : [input];
   if (added.length === 0) return;
   events = [...events, ...added].slice(-MAX_EVENTS);
+  if (added.some((e) => e.level === 'error')) hidden = false;
+  emit();
+}
+
+function hideConsole() {
+  hidden = true;
   emit();
 }
 
@@ -57,6 +66,14 @@ function subscribe(listener: () => void) {
 const getSnapshot = () => events;
 const EMPTY: DebugEvent[] = [];
 const getServerSnapshot = () => EMPTY;
+
+const getShown = () => DEBUG_CONSOLE_ENABLED && !hidden;
+const getServerShown = () => DEBUG_CONSOLE_ENABLED;
+
+// Whether the console bar is on screen, so the page can leave room for it.
+export function useDebugConsoleShown(): boolean {
+  return useSyncExternalStore(subscribe, getShown, getServerShown);
+}
 
 // ---------------------------------------------------------------------------
 // Global capture
@@ -120,6 +137,7 @@ function asText(list: DebugEvent[]) {
 
 export default function DebugConsole() {
   const list = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
+  const shown = useDebugConsoleShown();
   const [open, setOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   const seenErrors = useRef(0);
@@ -150,7 +168,8 @@ export default function DebugConsole() {
     }
   }
 
-  if (!DEBUG_CONSOLE_ENABLED) return null;
+  // Stays mounted while hidden so it still notices the next error.
+  if (!shown) return null;
 
   return (
     <section
@@ -166,12 +185,12 @@ export default function DebugConsole() {
           <span aria-hidden>{open ? '▾' : '▸'}</span>
           <span className="font-semibold">Console</span>
           {errorCount > 0 && (
-            <span className="rounded bg-red-600 px-1.5 py-0.5 text-white">
+            <span className="whitespace-nowrap rounded bg-red-600 px-1.5 py-0.5 text-white">
               {errorCount} error{errorCount === 1 ? '' : 's'}
             </span>
           )}
           {warnCount > 0 && (
-            <span className="rounded bg-yellow-500 px-1.5 py-0.5 text-gray-950">
+            <span className="whitespace-nowrap rounded bg-yellow-500 px-1.5 py-0.5 text-gray-950">
               {warnCount} warning{warnCount === 1 ? '' : 's'}
             </span>
           )}
@@ -187,6 +206,14 @@ export default function DebugConsole() {
             </button>
           </>
         )}
+        <button
+          onClick={hideConsole}
+          aria-label="Hide console until the next error"
+          title="Hide until the next error"
+          className="-mr-2 px-2 text-base leading-none text-gray-300 hover:text-white"
+        >
+          ×
+        </button>
       </div>
 
       {open && (
