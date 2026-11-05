@@ -18,6 +18,7 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [degraded, setDegraded] = useState(false);
+  const [partial, setPartial] = useState(false);
   const [activePhraseIndex, setActivePhraseIndex] = useState<number | null>(null);
   const consoleShown = useDebugConsoleShown();
 
@@ -27,6 +28,7 @@ export default function Home() {
     setLoading(true);
     setError(null);
     setDegraded(false);
+    setPartial(false);
     setWords(null);
     setActivePhraseIndex(null);
 
@@ -53,6 +55,7 @@ export default function Home() {
       const data = (await response.json()) as SwapResult;
       if (data.debug) logDebug(data.debug);
       setDegraded(data.degraded);
+      setPartial(data.partial === true);
       setWords(expandToWords(data.segments));
     } catch (err) {
       logDebug(
@@ -133,7 +136,7 @@ export default function Home() {
           <div className="flex items-center justify-between mb-6">
             <p className="text-sm text-gray-400">Tap any Italian word to see its meaning</p>
             <button
-              onClick={() => { setWords(null); setActivePhraseIndex(null); }}
+              onClick={() => { setWords(null); setActivePhraseIndex(null); setPartial(false); }}
               className="text-sm text-amber-500 hover:text-amber-600 font-medium"
             >
               ← New text
@@ -143,6 +146,12 @@ export default function Home() {
           {degraded && (
             <p role="status" className="mb-6 rounded-xl bg-gray-100 px-4 py-3 text-sm text-gray-700">
               We couldn&apos;t mix this text right now, so it&apos;s shown as-is. Please try again in a moment.
+            </p>
+          )}
+
+          {partial && !degraded && (
+            <p role="status" className="mb-6 rounded-xl bg-gray-100 px-4 py-3 text-sm text-gray-700">
+              Some passages couldn&apos;t be mixed in time, so they&apos;re shown as-is. Try again to mix the whole text.
             </p>
           )}
 

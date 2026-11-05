@@ -29,6 +29,10 @@ export interface SwapResult {
   // returned something unusable). The UI should say so instead of implying
   // the text was mixed.
   degraded: boolean;
+  // True when some chunks of a long text couldn't be translated in time and
+  // are shown as original text. Present only when true; never set together
+  // with `degraded` (that's when every chunk failed).
+  partial?: boolean;
   // What happened during the request, for the in-app debug console. Omitted
   // from API responses when NEXT_PUBLIC_DEBUG_CONSOLE=false.
   debug?: DebugEvent[];

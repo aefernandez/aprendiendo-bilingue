@@ -3,6 +3,9 @@ import { selectSpans } from './tagger';
 import { reconstructSegments } from './segmenter';
 import { loadLlmConfig, missingKey, type LlmConfig } from './llmConfig';
 import { Diagnostics } from './diagnostics';
+import { chunkText, type TextRange } from './chunker';
+import { runChunks, type ChunkOutcome } from './chunkRunner';
+import { classifyLlmError } from './llmErrors';
 
 // ---------------------------------------------------------------------------
 // Prompts
@@ -127,11 +130,42 @@ export function parseTranslations(content: string, count: number): string[] | nu
 // Backend call
 // ---------------------------------------------------------------------------
 
-// Total time budget for one swap, across the first call and any retry.
+// Total time budget for one swap, across all calls and any retries.
 // The spec requires results within 15 s; leave headroom for the response.
 export const SWAP_DEADLINE_MS = 14_000;
 // Don't start a retry unless at least this much of the budget remains.
 const MIN_RETRY_MS = 4_000;
+// A first attempt gets at most this long, so a slow provider leaves time for a
+// retry (which OpenRouter will likely route elsewhere).
+const FIRST_ATTEMPT_MS = 8_000;
+// Retries across all chunks of one request.
+const MAX_CHUNK_RETRIES = 2;
+
+// Long texts are split into chunks translated in parallel: one serial call
+// can't produce several thousand output tokens inside the deadline.
+// Estimated output tokens per chunk (see phraseTokens). Texts under this are
+// sent as a single call, exactly as before chunking existed.
+//
+// Tuned live (Nov 2026, Gemma 4 26B): real output is ~0.85× the estimate;
+// fast providers run ~85–130 tok/s, the p90 floor we route to is ~50 tok/s,
+// and the cheapest provider measured 31 tok/s (493 tokens in 15.8 s). 400
+// estimated ≈ 340 real tokens ≈ 4 s fast / 7 s at p90, inside FIRST_ATTEMPT_MS.
+export const CHUNK_TARGET_TOKENS = 400;
+// At the 12,000-char cap Level 1 estimates ~7.1K tokens: 16 chunks keeps them
+// near 450. Each call resends the full text (~3.3K input tokens), so the cap
+// costs ~55K input tokens ≈ $0.002–0.004 per request.
+export const MAX_CHUNKS = 16;
+
+// Estimated output tokens for one phrase: JSON item overhead plus the
+// translation. Measured ~11 tokens per Level 1 phrase on Gemma 4.
+export function phraseTokens(span: Span): number {
+  return 9 + Math.ceil(span.text.length / 3);
+}
+
+// OpenRouter routing: deprioritise (not exclude) endpoints whose p90
+// throughput is under this many tokens/s, so slow providers stop serving the
+// calls that have to finish inside the deadline.
+const PREFERRED_MIN_THROUGHPUT_P90 = 40;
 // Upstream error bodies can be large HTML pages or echo the prompt; log a slice.
 const MAX_LOGGED_BODY_CHARS = 300;
 
@@ -157,21 +191,18 @@ function describeBackend(config: LlmConfig): string {
   return `model ${config.model} via ${host}`;
 }
 
-async function callModel(
+/**
+ * The chat-completions body for one call. `text` is always the whole input
+ * text (the model needs it for agreement); `spans` are only the phrases this
+ * call translates. Attempt 2 uses the stricter retry prompt.
+ */
+export function buildRequestBody(
   config: LlmConfig,
-  userMessage: string,
+  text: string,
   spans: Span[],
-  timeoutMs: number,
-  diag: Diagnostics,
-  attempt: string,
-): Promise<string[] | null> {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
-  if (config.isOpenRouter) {
-    headers['HTTP-Referer'] = 'https://aprendiendo-bilingue.vercel.app';
-    headers['X-Title'] = 'Aprendiendo Bilingue';
-  }
-
+  attempt: number,
+): Record<string, unknown> {
+  const userMessage = attempt === 1 ? buildUserMessage(text, spans) : buildRetryMessage(text, spans);
   const body: Record<string, unknown> = {
     model: config.model,
     messages: [
@@ -181,10 +212,36 @@ async function callModel(
     temperature: 0,
     max_tokens: maxTokensFor(spans),
   };
-  if (config.structuredOutputs) {
-    body.response_format = RESPONSE_FORMAT;
-    // Only route to OpenRouter providers that actually enforce the schema.
-    if (config.isOpenRouter) body.provider = { require_parameters: true };
+  if (config.structuredOutputs) body.response_format = RESPONSE_FORMAT;
+  if (config.isOpenRouter) {
+    body.provider = {
+      // Only route to providers that actually enforce the schema.
+      ...(config.structuredOutputs ? { require_parameters: true } : {}),
+      preferred_min_throughput: { p90: PREFERRED_MIN_THROUGHPUT_P90 },
+    };
+    // Gemma 4 doesn't reason by default; say so explicitly so a provider or
+    // model default can't spend the deadline on thinking tokens.
+    body.reasoning = { enabled: false };
+  }
+  return body;
+}
+
+const fail = (reason: string, retryable = true, retryAfterMs?: number): ChunkOutcome<string[]> =>
+  retryAfterMs === undefined ? { ok: false, reason, retryable } : { ok: false, reason, retryable, retryAfterMs };
+
+async function callModel(
+  config: LlmConfig,
+  body: Record<string, unknown>,
+  count: number,
+  timeoutMs: number,
+  diag: Diagnostics,
+  attempt: string,
+): Promise<ChunkOutcome<string[]>> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
+  if (config.isOpenRouter) {
+    headers['HTTP-Referer'] = 'https://aprendiendo-bilingue.vercel.app';
+    headers['X-Title'] = 'Aprendiendo Bilingue';
   }
 
   try {
@@ -201,7 +258,12 @@ async function callModel(
         `${attempt}: LLM error ${response.status} from ${config.model}`,
         errorBody.slice(0, MAX_LOGGED_BODY_CHARS),
       );
-      return null;
+      const kind = classifyLlmError(response.status, errorBody, response.headers.get('retry-after'));
+      const after = kind.retryAfterMs === undefined ? '' : `, Retry-After ${Math.round(kind.retryAfterMs / 1000)} s`;
+      if (kind.kind === 'rate_limited') return fail(`rate limited (429${after})`, false);
+      if (kind.kind === 'spend_limit') return fail(`spend limit reached (${kind.limitSource})`, false);
+      if (kind.kind === 'in_flight_budget') return fail(`in-flight budget full${after}`, true, kind.retryAfterMs);
+      return fail(`LLM error ${response.status}`);
     }
 
     const raw = await response.text();
@@ -210,30 +272,83 @@ async function callModel(
       data = JSON.parse(raw);
     } catch {
       diag.error(`${attempt}: LLM returned a non-JSON response`, raw.slice(0, MAX_LOGGED_BODY_CHARS));
-      return null;
+      return fail('non-JSON response');
     }
     const content: unknown = (data as { choices?: { message?: { content?: unknown } }[] })?.choices?.[0]?.message
       ?.content;
     if (typeof content !== 'string' || !content) {
       diag.error(`${attempt}: LLM reply had no message content`, raw.slice(0, MAX_LOGGED_BODY_CHARS));
-      return null;
+      return fail('no message content');
     }
 
-    const translations = parseTranslations(content, spans.length);
+    const translations = parseTranslations(content, count);
     if (!translations) {
       diag.error(
-        `${attempt}: couldn't use the model's reply (expected ${spans.length} numbered translations)`,
+        `${attempt}: couldn't use the model's reply (expected ${count} numbered translations)`,
         content.slice(0, MAX_LOGGED_BODY_CHARS),
       );
+      return fail('unusable reply');
     }
-    return translations;
+    return { ok: true, value: translations };
   } catch (err) {
     const name = err instanceof Error ? err.name : 'Error';
     const message = err instanceof Error ? err.message : String(err);
     const reason = name === 'TimeoutError' ? `timed out after ${timeoutMs} ms` : `failed (${name})`;
     diag.error(`${attempt}: LLM call ${reason}`, message.slice(0, MAX_LOGGED_BODY_CHARS));
-    return null;
+    // A capped first attempt that timed out is worth retrying if time remains;
+    // the runner checks the remaining budget.
+    return fail(`LLM call ${reason}`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Chunking
+// ---------------------------------------------------------------------------
+
+interface ChunkJob {
+  index: number; // 1-based, among chunks that have phrases
+  spans: Span[];
+}
+
+const formatMs = (ms: number) => ms.toLocaleString('en-US');
+
+/** Groups spans (sorted, global offsets) into per-chunk jobs. */
+export function planChunks(text: string, spans: Span[]): Span[][] {
+  // Prefix sums of estimated tokens by span start, so a range's weight is two
+  // binary searches.
+  const starts = spans.map((s) => s.start);
+  const prefix = [0];
+  for (const span of spans) prefix.push(prefix[prefix.length - 1] + phraseTokens(span));
+  const firstAtOrAfter = (position: number) => {
+    let lo = 0;
+    let hi = starts.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (starts[mid] < position) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  };
+  const weight = (r: TextRange) => prefix[firstAtOrAfter(r.end)] - prefix[firstAtOrAfter(r.start)];
+
+  const chunks = chunkText(text, {
+    locale: 'en',
+    target: CHUNK_TARGET_TOKENS,
+    maxChunks: MAX_CHUNKS,
+    weight,
+    protect: spans,
+  });
+
+  // Each span belongs to the chunk containing its start. `protect` keeps spans
+  // from crossing a chunk end, and chunks tile the text, so this is a partition.
+  const groups: Span[][] = [];
+  let next = 0;
+  for (const chunk of chunks) {
+    const group: Span[] = [];
+    while (next < spans.length && spans[next].start < chunk.end) group.push(spans[next++]);
+    if (group.length > 0) groups.push(group);
+  }
+  return groups;
 }
 
 // ---------------------------------------------------------------------------
@@ -269,24 +384,82 @@ export async function swap(text: string, level: Level, options: SwapOptions = {}
     diag.info(`Level ${level}: no phrases selected to swap`);
     return { segments: [{ text, lang: 'source', translation: null }], degraded: false, debug: diag.events };
   }
-  diag.info(`Level ${level}: ${spans.length} phrases → ${describeBackend(config)}`);
-
-  let translations = await callModel(config, buildUserMessage(text, spans), spans, remaining(), diag, 'Attempt 1');
-
-  if (!translations) {
-    if (remaining() < Math.min(MIN_RETRY_MS, deadlineMs / 3)) {
-      diag.error('No time left to retry — returning original text');
-      return fallback(text, diag);
-    }
-    diag.warn(`Retrying ${spans.length} phrases`);
-    translations = await callModel(config, buildRetryMessage(text, spans), spans, remaining(), diag, 'Attempt 2');
+  if (config.model.endsWith(':free')) {
+    diag.warn(`${config.model} is a free model with a per-minute request cap; long texts make up to ${MAX_CHUNKS} calls`);
   }
 
-  if (!translations) {
-    diag.error('No usable translations after retry — returning original text');
+  const jobs: ChunkJob[] = planChunks(text, spans).map((group, i) => ({ index: i + 1, spans: group }));
+  const n = jobs.length;
+  if (n === 1) {
+    diag.info(`Level ${level}: ${spans.length} phrases → ${describeBackend(config)}`);
+  } else {
+    const tokens = spans.reduce((sum, s) => sum + phraseTokens(s), 0);
+    diag.info(
+      `Level ${level}: ${spans.length} phrases in ${n} chunks (~${Math.round(tokens / n)} tokens each) → ${describeBackend(config)}`,
+    );
+  }
+
+  // A single chunk keeps the pre-chunking wording ("Attempt 1", "Retrying 3 phrases").
+  const label = (job: ChunkJob) => (n === 1 ? `${job.spans.length} phrases` : `Chunk ${job.index}/${n}`);
+  const attemptLabel = (job: ChunkJob, attempt: number) =>
+    n === 1 ? `Attempt ${attempt}` : `${label(job)} · attempt ${attempt}`;
+
+  const results = await runChunks(
+    jobs,
+    (job, attempt, timeoutMs) =>
+      callModel(
+        config,
+        buildRequestBody(config, text, job.spans, attempt),
+        job.spans.length,
+        timeoutMs,
+        diag,
+        attemptLabel(job, attempt),
+      ),
+    {
+      remaining,
+      firstAttemptMs: FIRST_ATTEMPT_MS,
+      maxRetries: MAX_CHUNK_RETRIES,
+      minRetryMs: Math.min(MIN_RETRY_MS, deadlineMs / 3),
+      diag,
+      label,
+    },
+  );
+
+  const keptSpans: Span[] = [];
+  const translations: string[] = [];
+  let failedChunks = 0;
+  let failedPhrases = 0;
+  results.forEach((result, i) => {
+    const job = jobs[i];
+    if (result.value) {
+      keptSpans.push(...job.spans);
+      translations.push(...result.value);
+      if (n > 1) diag.info(`${label(job)}: ${job.spans.length} phrases in ${formatMs(result.ms)} ms`);
+    } else {
+      failedChunks++;
+      failedPhrases += job.spans.length;
+    }
+  });
+
+  if (failedChunks === n) {
+    diag.error('No usable translations — returning original text');
     return fallback(text, diag);
   }
 
-  diag.info(`Done in ${Date.now() - startedAt} ms`);
-  return { segments: reconstructSegments(text, spans, translations), degraded: false, debug: diag.events };
+  const partial = failedChunks > 0;
+  if (partial) {
+    diag.warn(
+      `Partial result: ${failedChunks} of ${n} chunks (${failedPhrases} of ${spans.length} phrases) shown as original text`,
+    );
+  }
+  const elapsed = Date.now() - startedAt;
+  diag.info(n === 1 ? `Done in ${elapsed} ms` : `Done in ${formatMs(elapsed)} ms (${n} chunks${partial ? ', partial' : ''})`);
+
+  const result: SwapResult = {
+    segments: reconstructSegments(text, keptSpans, translations),
+    degraded: false,
+    debug: diag.events,
+  };
+  if (partial) result.partial = true;
+  return result;
 }
