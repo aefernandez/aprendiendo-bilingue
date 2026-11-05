@@ -1,0 +1,171 @@
+[
+  {
+    "id": "en-news-1",
+    "file": "en-news-1.txt",
+    "lang": "en",
+    "genre": "news",
+    "words": 1000,
+    "nativeChecked": false,
+    "latency": true,
+    "notes": "Latency fixture (~1,000 words)."
+  },
+  {
+    "id": "en-news-2",
+    "file": "en-news-2.txt",
+    "lang": "en",
+    "genre": "news",
+    "words": 500,
+    "nativeChecked": false
+  },
+  {
+    "id": "en-news-3",
+    "file": "en-news-3.txt",
+    "lang": "en",
+    "genre": "news",
+    "words": 300,
+    "nativeChecked": false
+  },
+  {
+    "id": "en-email-1",
+    "file": "en-email-1.txt",
+    "lang": "en",
+    "genre": "email",
+    "words": 250,
+    "nativeChecked": false
+  },
+  {
+    "id": "en-email-2",
+    "file": "en-email-2.txt",
+    "lang": "en",
+    "genre": "email",
+    "words": 150,
+    "nativeChecked": false
+  },
+  {
+    "id": "en-email-3",
+    "file": "en-email-3.txt",
+    "lang": "en",
+    "genre": "email",
+    "words": 100,
+    "nativeChecked": false
+  },
+  {
+    "id": "en-social-1",
+    "file": "en-social-1.txt",
+    "lang": "en",
+    "genre": "social",
+    "words": 60,
+    "nativeChecked": false
+  },
+  {
+    "id": "en-torture",
+    "file": "en-torture.txt",
+    "lang": "en",
+    "genre": "social",
+    "words": 140,
+    "nativeChecked": false,
+    "torture": true,
+    "notes": "TORTURE (not natural prose): contractions, O'Brien, dogs', well-known, e-mail, Mr./Dr./U.S./Jan./St., a.m., $ and %, 1,250, URL with query, email, @handle, #tag, emoji, curly quotes, NBSP, 'I met Tom. He left.', 'We visited the US. It was big.', repeated 'come'."
+  },
+  {
+    "id": "en-recipe-1",
+    "file": "en-recipe-1.txt",
+    "lang": "en",
+    "genre": "recipe",
+    "words": 400,
+    "nativeChecked": false
+  },
+  {
+    "id": "en-recipe-2",
+    "file": "en-recipe-2.txt",
+    "lang": "en",
+    "genre": "recipe",
+    "words": 250,
+    "nativeChecked": false
+  },
+  {
+    "id": "es-news-1",
+    "file": "es-news-1.txt",
+    "lang": "es",
+    "genre": "news",
+    "words": 1000,
+    "nativeChecked": false,
+    "latency": true,
+    "notes": "Latency fixture (~1,000 words)."
+  },
+  {
+    "id": "es-news-2",
+    "file": "es-news-2.txt",
+    "lang": "es",
+    "genre": "news",
+    "words": 500,
+    "nativeChecked": false
+  },
+  {
+    "id": "es-news-3",
+    "file": "es-news-3.txt",
+    "lang": "es",
+    "genre": "news",
+    "words": 300,
+    "nativeChecked": false,
+    "notes": "Opens with an English quote."
+  },
+  {
+    "id": "es-email-1",
+    "file": "es-email-1.txt",
+    "lang": "es",
+    "genre": "email",
+    "words": 250,
+    "nativeChecked": false
+  },
+  {
+    "id": "es-email-2",
+    "file": "es-email-2.txt",
+    "lang": "es",
+    "genre": "email",
+    "words": 150,
+    "nativeChecked": false
+  },
+  {
+    "id": "es-email-3",
+    "file": "es-email-3.txt",
+    "lang": "es",
+    "genre": "email",
+    "words": 100,
+    "nativeChecked": false
+  },
+  {
+    "id": "es-social-1",
+    "file": "es-social-1.txt",
+    "lang": "es",
+    "genre": "social",
+    "words": 60,
+    "nativeChecked": false
+  },
+  {
+    "id": "es-torture",
+    "file": "es-torture.txt",
+    "lang": "es",
+    "genre": "social",
+    "words": 140,
+    "nativeChecked": false,
+    "torture": true,
+    "notes": "TORTURE (not natural prose): Sr./Sra./Ayto./EE. UU./p. ej./a. m., 2º, 4.º, 1.000, 3,5, 10:30h, 3años, dámelo, del/al, ¿¡, curly quotes, NBSP, emoji, URL with query, email, @handle, #tag, 'Yo sí. Luego', repeated 'come', NFD accents in 'cafetería'."
+  },
+  {
+    "id": "es-recipe-1",
+    "file": "es-recipe-1.txt",
+    "lang": "es",
+    "genre": "recipe",
+    "words": 400,
+    "nativeChecked": false
+  },
+  {
+    "id": "es-recipe-2",
+    "file": "es-recipe-2.txt",
+    "lang": "es",
+    "genre": "recipe",
+    "words": 250,
+    "nativeChecked": false
+  }
+]
