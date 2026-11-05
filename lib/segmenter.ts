@@ -1,6 +1,7 @@
 import type { Segment, Span, Word } from './types';
+import { getSegmenter } from './intlSegmenters';
 
-const segmenter = new Intl.Segmenter('it', { granularity: 'word' });
+const segmenter = getSegmenter('it', 'word');
 
 export function reconstructSegments(
   original: string,
