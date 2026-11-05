@@ -5,15 +5,22 @@
 //   multi-word:   [s, e, startAnchor, endAnchor, translation, pos] (6 elements)
 // `anchor`/`startAnchor` is word s copied exactly; `endAnchor` is word e.
 // The element count is the discriminator. A 6-tuple with s == e is accepted
-// (endAnchor is then checked against word s). A 5-tuple with e > s carries no
-// end anchor, so its end can't be verified and it is dropped ('endAnchor').
-// A non-string or unknown pos keeps the item with `pos: undefined`.
+// (endAnchor is then checked against word s). Lenient forms, for models that
+// drop trailing fields: [s, s, anchor, translation] (no pos), and a 5-tuple with
+// e > s whose last element is not a POS code is read as
+// [s, e, startAnchor, endAnchor, translation]. Any other item with e > s carries
+// no end anchor, so its end can't be verified and it is dropped ('endAnchor').
+// Indices may be integers or digit strings ("3"). A non-string or unknown pos
+// keeps the item with `pos: undefined`.
 
 import { isPosCode, type PosCode } from '../pos';
 import type { TextRange, WordToken } from './tokenize';
 
 export interface SpanItem {
-  /** Chunk-local inclusive word indices. */
+  /**
+   * Chunk-local inclusive word indices (into ValidateCtx.tokens). Use the
+   * absolute `start`/`end` offsets once items from several chunks are merged.
+   */
   startWord: number;
   endWord: number;
   /** Absolute UTF-16 offsets into the original text. */
@@ -27,7 +34,7 @@ export interface SpanItem {
 }
 
 export type DropReason =
-  | 'shape' | 'bounds' | 'anchor' | 'endAnchor' | 'numeric' | 'sentence' | 'overlap'
+  | 'shape' | 'bounds' | 'anchor' | 'endAnchor' | 'numeric' | 'sentence' | 'masked' | 'overlap'
   | 'empty' | 'newline' | 'url' | 'length';
 
 export interface ValidationStats {
@@ -56,6 +63,11 @@ export interface ValidateCtx {
   text: string;
   /** Chunk tokens, indexed from 0. */
   tokens: readonly WordToken[];
+  /**
+   * Masked ranges from tokenizeWords (URLs, emails, domains). Required: a span
+   * whose range covers one is dropped, or the swap would delete the URL.
+   */
+  masked: readonly TextRange[];
   /** Sentence ranges (absolute offsets). Omitted → the chunk is one sentence. */
   sentences?: readonly TextRange[];
 }
@@ -82,14 +94,23 @@ export function normWord(s: string): string {
  * the first part for a start anchor ("well" → well-known), the last part for an
  * end anchor ("known" → well-known).
  */
-export function anchorMatches(anchor: string, token: string, side: 'start' | 'end' = 'start'): boolean {
-  const a = normWord(anchor);
-  const t = normWord(token);
+export function anchorMatches(
+  anchor: string,
+  token: string,
+  side: 'start' | 'end' = 'start',
+  ignoreAccents = false,
+): boolean {
+  const a = ignoreAccents ? stripAccents(normWord(anchor)) : normWord(anchor);
+  const t = ignoreAccents ? stripAccents(normWord(token)) : normWord(token);
   if (!a) return false;
   if (a === t) return true;
   if (a.length < 2) return false;
   if (side === 'start') return t.startsWith(a) && /^['-]/.test(t.slice(a.length));
   return t.endsWith(a) && /['-]$/.test(t.slice(0, t.length - a.length));
+}
+
+function stripAccents(s: string): string {
+  return s.normalize('NFD').replace(/\p{M}+/gu, '').normalize('NFC');
 }
 
 function normPhrase(s: string): string {
@@ -116,19 +137,28 @@ interface Tuple {
   pos?: PosCode;
 }
 
+function toIndex(v: unknown): number | null {
+  if (typeof v === 'number') return Number.isInteger(v) ? v : null;
+  if (typeof v === 'string' && /^\s*\d{1,6}\s*$/.test(v)) return Number(v);
+  return null;
+}
+
 function readTuple(it: unknown): Tuple | null {
-  if (!Array.isArray(it) || (it.length !== 5 && it.length !== 6)) return null;
-  const [s, e, anchor] = it;
-  const six = it.length === 6;
-  const endAnchor: unknown = six ? it[3] : undefined;
-  const translation: unknown = it[six ? 4 : 3];
-  const pos: unknown = it[six ? 5 : 4];
-  if (!Number.isInteger(s) || !Number.isInteger(e)) return null;
+  if (!Array.isArray(it) || it.length < 4 || it.length > 6) return null;
+  const s = toIndex(it[0]);
+  const e = toIndex(it[1]);
+  if (s === null || e === null) return null;
+  const strs = it.slice(2);
+  let anchor: unknown, endAnchor: unknown, translation: unknown, pos: unknown;
+  if (it.length === 6) [anchor, endAnchor, translation, pos] = strs;
+  else if (it.length === 4) [anchor, translation] = strs;
+  else if (e > s && !isPosCode(it[4])) [anchor, endAnchor, translation] = strs;
+  else [anchor, translation, pos] = strs;
   if (typeof anchor !== 'string' || typeof translation !== 'string') return null;
-  if (six && typeof endAnchor !== 'string') return null;
+  if (endAnchor !== undefined && typeof endAnchor !== 'string') return null;
   return {
-    s: s as number,
-    e: e as number,
+    s,
+    e,
     anchor,
     endAnchor: endAnchor as string | undefined,
     translation,
@@ -136,7 +166,9 @@ function readTuple(it: unknown): Tuple | null {
   };
 }
 
-type EndState = 'inclusive' | 'exclusive' | 'both' | 'fixed';
+// both = end anchor at e and e-1 (repeated word); exclOrNext = at e-1 and e+1.
+// Both are settled by the chunk mode after every item has been read.
+type EndState = 'inclusive' | 'exclusive' | 'both' | 'exclOrNext' | 'fixed';
 
 interface Candidate {
   s: number;
@@ -150,8 +182,9 @@ interface Candidate {
  * Checks raw items against the chunk's tokens. Pure; never throws.
  * Order of checks: shape → start anchor (±1/±2 repair, both ends shifted; equally
  * near twins → drop) → end anchor for multi-word items (e, else e-1 = exclusive
- * end, else e+1, else ±2; twins → drop) → bounds → sort → numeric endpoints →
- * sentence crossing → overlap → translation checks → cognate.
+ * end, else e+1, else ±2; equally plausible twins → drop) → bounds → sort →
+ * numeric endpoints → sentence crossing → masked range inside → overlap →
+ * translation checks → cognate.
  */
 export function validateItems(items: readonly unknown[], ctx: ValidateCtx): ValidationResult {
   const { text, tokens } = ctx;
@@ -182,7 +215,9 @@ export function validateItems(items: readonly unknown[], ctx: ValidateCtx): Vali
 
     // Start anchor.
     const startAt = (k: number) => k >= 0 && k < n && anchorMatches(tup.anchor, tokens[k].text, 'start');
-    if (startAt(s)) {
+    // Accent-insensitive only at the given index: in a repair search it could
+    // pick a wrong twin (el/él, si/sí).
+    if (startAt(s) || (s >= 0 && s < n && anchorMatches(tup.anchor, tokens[s].text, 'start', true))) {
       stats.anchorExact++;
     } else {
       stats.anchorMismatch++;
@@ -215,21 +250,23 @@ export function validateItems(items: readonly unknown[], ctx: ValidateCtx): Vali
     } else {
       const ea = tup.endAnchor;
       const endAt = (k: number) => k >= s && k < n && anchorMatches(ea, tokens[k].text, 'end');
-      const atE = endAt(e);
+      const atE = endAt(e) || (e >= s && e < n && anchorMatches(ea, tokens[e].text, 'end', true));
       const atPrev = endAt(e - 1);
+      const atNext = endAt(e + 1);
+      // Same tie rule as the start anchor: equally plausible positions → drop.
+      // e-1 (exclusive end) and e+1 are both one step away; e+1 and e-2 are
+      // both one step from the exclusive reading e-1.
       if (atE && atPrev) end = 'both';
       else if (atE) end = 'inclusive';
+      else if (atPrev && atNext) end = 'exclOrNext';
       else if (atPrev) {
         end = 'exclusive';
         e -= 1;
       } else {
         let moved = 0;
-        if (endAt(e + 1)) moved = 1;
-        else {
-          const lo = endAt(e - 2);
-          const hi = endAt(e + 2);
-          if (lo !== hi) moved = lo ? -2 : 2;
-        }
+        const atPrev2 = endAt(e - 2);
+        if (atNext) moved = atPrev2 ? 0 : 1;
+        else if (atPrev2 !== endAt(e + 2)) moved = atPrev2 ? -2 : 2;
         if (!moved) {
           drop('endAnchor');
           continue;
@@ -252,18 +289,29 @@ export function validateItems(items: readonly unknown[], ctx: ValidateCtx): Vali
   // Chunk-level mode only resolves items whose end anchor matches both e and e-1
   // (a repeated word): never overrides an unambiguous end anchor.
   stats.exclusiveMode = stats.exclusiveEnds >= 2 && stats.exclusiveEnds > stats.endAnchorExact;
+  const resolved: Candidate[] = [];
   for (const c of cands) {
-    if (c.end !== 'both') continue;
-    if (stats.exclusiveMode) {
+    if (c.end === 'both') {
+      if (stats.exclusiveMode) {
+        c.e -= 1;
+        stats.exclusiveEnds++;
+      } else if (c.e > c.s) stats.endAnchorExact++;
+    } else if (c.end === 'exclOrNext') {
+      if (!stats.exclusiveMode) {
+        drop('endAnchor');
+        continue;
+      }
       c.e -= 1;
       stats.exclusiveEnds++;
-    } else if (c.e > c.s) stats.endAnchorExact++;
+    }
+    resolved.push(c);
   }
 
-  cands.sort((a, b) => a.s - b.s || a.e - b.e);
+  resolved.sort((a, b) => a.s - b.s || a.e - b.e);
+  const masked = [...ctx.masked].sort((a, b) => a.start - b.start);
   const kept: SpanItem[] = [];
   let lastEnd = -1;
-  for (const c of cands) {
+  for (const c of resolved) {
     const { s, e } = c;
     // Trimming numeric ends inward duplicated numbers ("a las 10:30h" → "alle 10:30 10:30h"): drop.
     if (tokens[s].numeric || tokens[e].numeric) {
@@ -274,12 +322,16 @@ export function validateItems(items: readonly unknown[], ctx: ValidateCtx): Vali
       drop('sentence');
       continue;
     }
+    const start = tokens[s].start;
+    const end = tokens[e].end;
+    if (masked.some(m => m.start < end && m.end > start)) {
+      drop('masked');
+      continue;
+    }
     if (s <= lastEnd) {
       drop('overlap');
       continue;
     }
-    const start = tokens[s].start;
-    const end = tokens[e].end;
     const source = text.slice(start, end);
     const t = c.translation.trim();
     if (!t) {

@@ -12,10 +12,14 @@ export function chunkTokens(tokens: readonly WordToken[], range: TextRange): Wor
   return out;
 }
 
+// A literal "[12]" in the source (a citation) would read like an index marker,
+// so square brackets in the gap text are shown fullwidth: "［[3]12］".
+
 /**
  * The numbered input the model reads: "[0]Juan [1]come [2]pan." Text between
- * tokens (spaces, punctuation, masked URLs) is copied verbatim.
- * `tokens` must lie inside `range` and be in text order.
+ * tokens (spaces, punctuation, masked URLs) is copied verbatim, except that
+ * literal square brackets become fullwidth ［ ］. This string is prompt-only: offsets never
+ * depend on it. `tokens` must lie inside `range` and be in text order.
  */
 export function numberedInput(
   text: string,
@@ -25,8 +29,12 @@ export function numberedInput(
   let out = '';
   let cursor = range.start;
   for (const t of tokens) {
-    out += text.slice(cursor, t.start) + `[${t.i}]` + t.text;
+    out += gap(text.slice(cursor, t.start)) + `[${t.i}]` + t.text;
     cursor = t.end;
   }
-  return out + text.slice(cursor, range.end);
+  return out + gap(text.slice(cursor, range.end));
+}
+
+function gap(s: string): string {
+  return s.replace(/\[/g, '［').replace(/\]/g, '］');
 }

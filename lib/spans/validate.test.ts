@@ -18,7 +18,8 @@ function sentences(text: string, ...starts: string[]): TextRange[] {
   return at.map((start, k) => ({ start, end: at[k + 1] ?? text.length }));
 }
 function ctx(text: string, loc: string, ...starts: string[]) {
-  return { text, tokens: tokenizeWords(text, loc).tokens, sentences: sentences(text, ...starts) };
+  const { tokens, masked } = tokenizeWords(text, loc);
+  return { text, tokens, masked, sentences: sentences(text, ...starts) };
 }
 
 const T = 'Juan come pan y bebe agua. Luego come fruta.';
@@ -170,7 +171,7 @@ describe('bounds, order, sentences, numbers', () => {
       [4, 7, 'bebe', 'come', 'xx', 'v'],
       [40, 41, 'zzz', 'zzz', 'x', 'n'],
       [1, 'a', 'come', 'x', 'v'],
-      [1, 1, 'come', 'x'],
+      [1, 1, 'come'],
       'nope',
       [2, 1, 'pan', 'x', 'n'],
     ], c());
@@ -187,7 +188,7 @@ describe('bounds, order, sentences, numbers', () => {
   });
 
   it('treats a chunk without sentence ranges as one sentence', () => {
-    const r = validateItems([[4, 6, 'bebe', 'Luego', 'x', 'v']], { text: T, tokens: tokenizeWords(T, 'es').tokens });
+    const r = validateItems([[4, 6, 'bebe', 'Luego', 'x', 'v']], { text: T, tokens: tokenizeWords(T, 'es').tokens, masked: [] });
     expect(r.stats.kept).toBe(1);
   });
 
@@ -205,7 +206,7 @@ describe('bounds, order, sentences, numbers', () => {
   it('works on chunk-local indices with absolute offsets', () => {
     const { tokens } = tokenizeWords(T, 'es');
     const local = chunkTokens(tokens, { start: 27, end: T.length });
-    const r = validateItems([[1, 2, 'come', 'fruta', 'mangia frutta', 'v']], { text: T, tokens: local });
+    const r = validateItems([[1, 2, 'come', 'fruta', 'mangia frutta', 'v']], { text: T, tokens: local, masked: [] });
     expect(r.kept[0]).toMatchObject({ startWord: 1, endWord: 2, source: 'come fruta', start: 33, end: 43 });
   });
 

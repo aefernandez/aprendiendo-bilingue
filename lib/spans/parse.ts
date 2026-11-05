@@ -15,7 +15,8 @@ export interface ParsedItems {
  * Strips `<think>…</think>` and code fences, then tries JSON.parse (accepting
  * `{"i":[…]}` or a bare array). If that fails, a string-aware bracket scanner
  * recovers every complete inner array. Returns null when nothing usable is found
- * (including an unclosed `<think>`).
+ * (including an unclosed `<think>`, or a salvage that recovers no item). A
+ * well-formed empty list (`{"i":[]}`) is a success with no items.
  */
 export function parseItems(content: string): ParsedItems | null {
   let text = content.replace(/<think>[\s\S]*?<\/think>/g, '').replace(/<think>[\s\S]*$/, '');
@@ -28,8 +29,10 @@ export function parseItems(content: string): ParsedItems | null {
     // fall through to salvage
   }
 
+  // Start at the "i" array, else at the first "[" that opens an array of arrays
+  // (so a stray "[1]" in prose is not taken for the item list).
   const key = text.search(/"i"\s*:\s*\[/);
-  const open = key >= 0 ? text.indexOf('[', key) : text.indexOf('[');
+  const open = key >= 0 ? text.indexOf('[', key) : text.search(/\[\s*\[/);
   if (open < 0) return null;
   const items: unknown[] = [];
   let depth = 0;
@@ -51,7 +54,7 @@ export function parseItems(content: string): ParsedItems | null {
       depth++;
     } else if (ch === ']') {
       // Outer array closed but the JSON was otherwise bad (e.g. trailing junk).
-      if (depth === 0) return { items, truncated: false };
+      if (depth === 0) return items.length ? { items, truncated: false } : null;
       depth--;
       if (depth === 0 && elemStart >= 0) {
         try {
