@@ -3,7 +3,7 @@
 import { useState } from 'react';
 import type { Word, Level, SwapResult } from '@/lib/types';
 import { expandToWords } from '@/lib/segmenter';
-import DebugConsole, { DEBUG_CONSOLE_ENABLED, clientEvent, logDebug } from './DebugConsole';
+import DebugConsole, { clientEvent, logDebug, useDebugConsoleShown } from './DebugConsole';
 
 const LEVELS: { value: Level; label: string; description: string }[] = [
   { value: 1, label: 'Dipping In', description: '~30% Italian' },
@@ -19,6 +19,7 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [degraded, setDegraded] = useState(false);
   const [activePhraseIndex, setActivePhraseIndex] = useState<number | null>(null);
+  const consoleShown = useDebugConsoleShown();
 
   async function handleSubmit() {
     if (!inputText.trim()) return;
@@ -68,7 +69,7 @@ export default function Home() {
     : null;
 
   return (
-    <main className={`min-h-screen max-w-2xl mx-auto px-4 pt-8 ${DEBUG_CONSOLE_ENABLED ? "pb-16" : "pb-8"}`}>
+    <main className={`min-h-screen max-w-2xl mx-auto px-4 pt-8 ${consoleShown ? "pb-16" : "pb-8"}`}>
       <header className="mb-8">
         <h1 className="text-2xl font-bold text-gray-900">Aprendiendo Bilingue</h1>
         <p className="text-sm text-gray-500 mt-1">Read anything in Italian, starting today.</p>
@@ -187,7 +188,7 @@ export default function Home() {
 
       {/* Definition card */}
       {activePhrase && (
-        <div className={`fixed ${DEBUG_CONSOLE_ENABLED ? 'bottom-10' : 'bottom-0'} left-0 right-0 bg-white border-t border-gray-200 shadow-xl p-6`}>
+        <div className={`fixed ${consoleShown ? 'bottom-10' : 'bottom-0'} left-0 right-0 bg-white border-t border-gray-200 shadow-xl p-6`}>
           <div className="max-w-2xl mx-auto flex items-start justify-between">
             <div>
               <p className="text-sm text-gray-400 mb-1">{activePhrase.phraseText}</p>
