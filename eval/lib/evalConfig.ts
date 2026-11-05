@@ -94,7 +94,10 @@ export function buildEvalEnv(fileEnv: Env, shellEnv: Env): Record<string, string
   const evalKey = merged.EVAL_LLM_API_KEY?.trim() ?? '';
   const appKeys = [fileEnv.LLM_API_KEY, fileEnv.OPENROUTER_API_KEY, shellEnv.LLM_API_KEY, shellEnv.OPENROUTER_API_KEY]
     .map((k) => k?.trim())
-    .filter((k): k is string => !!k && k !== evalKey);
+    .filter((k): k is string => !!k);
+  if (evalKey && appKeys.includes(evalKey)) {
+    throw new Error('EVAL_LLM_API_KEY is the same as the app key. Create a separate, capped OpenRouter key for evals.');
+  }
 
   merged.EVAL = shellEnv.EVAL ?? '';
   merged.EVAL_YES = shellEnv.EVAL_YES ?? '';

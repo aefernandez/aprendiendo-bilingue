@@ -263,6 +263,22 @@ describe('runSuite', () => {
     expect(inner).not.toHaveBeenCalled();
   });
 
+  it('treats a negative usage.cost as invalid and charges the estimate', async () => {
+    const inner = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({ model: MODEL, usage: { cost: -5 } }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+    const r = await runSuite(base({ env: LIVE, fetchImpl: inner, items: items(1) }));
+    expect(r.lines[0].costSource).toBe('estimate');
+    expect(r.lines[0].costUsd).toBeCloseTo(callCost(MODEL, { promptTokens: 1000, completionTokens: 200 }));
+  });
+
+  it('refuses to continue if the results directory vanishes mid-run', async () => {
+    const inner = vi.fn<typeof fetch>(async () => {
+      rmSync(dir, { recursive: true, force: true });
+      return completion(0.01);
+    });
+    await expect(runSuite(base({ env: LIVE, fetchImpl: inner }))).rejects.toThrow(/vanished/);
+    expect(inner).toHaveBeenCalledTimes(1);
+  });
+
   it('prices calls that errored or timed out without usage at the estimate', async () => {
     const inner = vi.fn<typeof fetch>(async () => {
       throw new DOMException('The operation was aborted.', 'TimeoutError');
@@ -300,7 +316,7 @@ describe('runSuite', () => {
   });
 
   it('stops when the upstream serves a different model than the plan priced', async () => {
-    const inner = vi.fn<typeof fetch>(async () => completion(0.001, { model: 'anthropic/claude-opus-5' }));
+    const inner = vi.fn<typeof fetch>(async () => completion(0.001, { model: `${MODEL}-20261101` })); // exact match only
     const r = await runSuite(base({ env: LIVE, fetchImpl: inner }));
     expect(r.status).toBe('aborted-model');
     expect(inner).toHaveBeenCalledTimes(1);
@@ -433,6 +449,13 @@ describe('eval config', () => {
   });
 });
 
+describe('eval key must differ from the app key', () => {
+  it('throws when EVAL_LLM_API_KEY equals an app key', () => {
+    expect(() => buildEvalEnv({ LLM_API_KEY: 'same', EVAL_LLM_API_KEY: 'same' }, {})).toThrow(/separate/);
+    expect(() => buildEvalEnv({ EVAL_LLM_API_KEY: 'same' }, { OPENROUTER_API_KEY: 'same' })).toThrow(/separate/);
+  });
+});
+
 describe('app keys are unusable (direct swap() calls)', () => {
   const TEXT = 'The dog runs home. The cat sleeps all day.';
   const files = { LLM_API_KEY: 'app-key', OPENROUTER_API_KEY: 'app-key-2', EVAL_LLM_API_KEY: 'eval-key' };
@@ -450,7 +473,7 @@ describe('app keys are unusable (direct swap() calls)', () => {
   it('eval worker, dry-run shell: swap() sends nothing', async () => {
     applyEnv(buildEvalEnv(files, {}));
     const inner = vi.fn<typeof fetch>(async () => completion(0));
-    vi.stubGlobal('fetch', guardFetch(inner)); // what eval/setup.ts installs
+    globalThis.fetch = guardFetch(inner); // what eval/setup.ts installs; restored by installThrowingFetch
     const result = await swap(TEXT, 1);
     expect(result.degraded).toBe(true);
     expect(inner).not.toHaveBeenCalled();
@@ -459,7 +482,7 @@ describe('app keys are unusable (direct swap() calls)', () => {
   it('eval worker, live shell with an app key exported: swap() uses only the eval key', async () => {
     applyEnv(buildEvalEnv(files, { EVAL: '1', EVAL_YES: '1', LLM_API_KEY: 'shell-app-key' }));
     const inner = vi.fn<typeof fetch>(async () => completion(0));
-    vi.stubGlobal('fetch', guardFetch(inner));
+    globalThis.fetch = guardFetch(inner);
     await swap(TEXT, 1);
     expect(inner).toHaveBeenCalled();
     expect(new Set(bearers(inner))).toEqual(new Set(['Bearer eval-key']));
@@ -469,7 +492,7 @@ describe('app keys are unusable (direct swap() calls)', () => {
     applyEnv(buildEvalEnv(files, { EVAL: '1', EVAL_YES: '1' }));
     vi.stubEnv('LLM_API_KEY', 'app-key'); // e.g. code that re-reads .env.local itself
     const inner = vi.fn<typeof fetch>(async () => completion(0));
-    vi.stubGlobal('fetch', guardFetch(inner));
+    globalThis.fetch = guardFetch(inner);
     const result = await swap(TEXT, 1);
     expect(result.degraded).toBe(true);
     expect(inner).not.toHaveBeenCalled();

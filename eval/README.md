@@ -71,7 +71,13 @@ EVAL=1 EVAL_YES=1 npm run eval -- <suite>   # run it
   - Spend is the larger of `spend.jsonl` and the costs recorded in every `calls.jsonl`, so
     deleting `spend.jsonl` doesn't reset it.
   - To allow more, raise `EVAL_MAX_USD`.
-- **Model check:** a run stops if OpenRouter serves a different model than the plan priced.
+  - If `results/` disappears mid-run, the run stops.
+  - Known limit (to fix in B2b): until the first item finishes, items are reserved at their
+    estimate. If the estimate is far too low, the first concurrent batch can overshoot the cap
+    by up to `concurrency` × the real per-item cost. Keep concurrency low until the estimates
+    are checked against real runs.
+- **Separate key:** a run refuses to start if `EVAL_LLM_API_KEY` equals an app key.
+- **Model check:** a run stops if OpenRouter serves a different model than the plan priced (exact slug match).
 - **One run per process:** suites call `runSuite` one at a time.
 - **Resume:** re-running the same command continues the newest unfinished run with the same
   config. Finished items are skipped and failed ones are retried.

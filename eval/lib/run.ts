@@ -170,7 +170,7 @@ function itemCost(item: PlanItem, calls: CallRecord[]): Pick<ItemLine, 'costUsd'
     if (COST_RANK.indexOf(s) > COST_RANK.indexOf(source)) source = s;
   };
   for (const c of sent) {
-    if (c.usage?.cost !== undefined) {
+    if (c.usage?.cost !== undefined && c.usage.cost >= 0) {
       usd += c.usage.cost;
     } else if (c.usage?.promptTokens !== undefined || c.usage?.completionTokens !== undefined) {
       usd += callCost(c.model ?? item.model, {
@@ -186,9 +186,9 @@ function itemCost(item: PlanItem, calls: CallRecord[]): Pick<ItemLine, 'costUsd'
   return { costUsd: usd, costSource: source };
 }
 
-/** OpenRouter may echo a dated variant of the slug; anything else means the estimate priced the wrong model. */
+/** Exact match only: any other served model means the estimate priced the wrong model. */
 export function sameModel(planned: string, served: string): boolean {
-  return served === planned || served.startsWith(`${planned}-`) || served.startsWith(`${planned}:`);
+  return served === planned;
 }
 
 /** Sum of costUsd over every run's calls.jsonl: a floor for spend if spend.jsonl was deleted. */
@@ -296,6 +296,7 @@ async function runSuiteInner<I extends PlanItem>(opts: RunOptions<I>): Promise<R
   let inFlight = 0;
   let abortedBudget = false;
   let modelMismatch: string | undefined;
+  let resultsVanished = false;
   let refused: LiveCallRefused | undefined;
   // Never below what this process has seen, even if spend.jsonl is deleted mid-run.
   const spentNow = () => Math.max(ledger.spent(), ledgerBefore + spentUsd);
@@ -308,9 +309,19 @@ async function runSuiteInner<I extends PlanItem>(opts: RunOptions<I>): Promise<R
         abortedBudget = true;
         return false;
       }
+      if (!existsSync(dir)) {
+        resultsVanished = true;
+        return false;
+      }
       inFlight++;
       const { value, error, calls } = await recorder.capture(() => opts.execute(item)).finally(() => inFlight--);
       const cost = itemCost(item, calls);
+      if (!existsSync(dir)) {
+        // Someone deleted results/ (and the ledger in it): keep the in-memory floor and stop.
+        spentUsd += cost.costUsd;
+        resultsVanished = true;
+        return false;
+      }
       const refusedCall = calls.find((c) => c.refused);
       if (error instanceof LiveCallRefused || refusedCall) {
         refused = error instanceof LiveCallRefused ? error : new LiveCallRefused(refusedCall!.url);
@@ -339,6 +350,9 @@ async function runSuiteInner<I extends PlanItem>(opts: RunOptions<I>): Promise<R
     globalThis.fetch = previousFetch;
   }
   if (refused) throw refused;
+  if (resultsVanished) {
+    throw new Error(`Results directory ${dir} vanished mid-run; refusing to continue (spend so far: ${formatUsd(spentNow())}).`);
+  }
 
   const lines = opts.items.map((i) => done.get(i.key)).filter((l): l is ItemLine => !!l);
   const complete = lines.length === opts.items.length && lines.every((l) => l.status === 'ok');
