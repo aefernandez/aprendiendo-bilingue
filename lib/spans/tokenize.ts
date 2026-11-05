@@ -99,22 +99,30 @@ function findMasks(text: string): Masked[] {
 }
 
 /**
- * True when a single quote opened before `pos` in the same sentence is still
- * unclosed, so an apostrophe at `pos` is a closing quote, not a possessive.
+ * Offsets of apostrophes that close a single quote opened earlier in the same
+ * paragraph (quoted dialogue often spans sentences: ‘Stop. Look at the bosses’).
+ * Such an apostrophe is a closing quote, not a possessive. One linear pass.
  * Opening = quote with no letter before and a letter after; closing = the reverse.
  */
-function openQuoteBefore(text: string, pos: number): boolean {
-  let from = pos;
-  while (from > 0 && !/[.!?\n]/.test(text[from - 1])) from--;
+function closingQuotes(text: string): Set<number> {
+  const out = new Set<number>();
   let open = 0;
-  for (let k = from; k < pos; k++) {
-    if (!QUOTE_APOS.has(text[k])) continue;
-    const before = LETTER_END.test(text.slice(Math.max(0, k - 2), k));
+  for (let k = 0; k < text.length; k++) {
+    const ch = text[k];
+    if (ch === '\n') {
+      open = 0;
+      continue;
+    }
+    if (!QUOTE_APOS.has(ch)) continue;
+    const before = k > 0 && LETTER_END.test(text.slice(Math.max(0, k - 2), k));
     const after = LETTER_START.test(text.slice(k + 1, k + 3));
     if (!before && after) open++;
-    else if (before && !after && open > 0) open--;
+    else if (before && !after && open > 0) {
+      open--;
+      out.add(k);
+    }
   }
-  return open > 0;
+  return out;
 }
 
 interface RawSegment {
@@ -129,8 +137,9 @@ interface RawSegment {
  * - letter + apostrophe/hyphen + letter with no spaces (well-known, mother-in-law,
  *   post-COVID; the segmenter already keeps don't and rock’n’roll whole, but
  *   rock-'n'-roll stays three tokens);
- * - plural possessives (dogs') — unless a single quote is still open in the
- *   sentence, so ‘yes’ and 'los gatos' keep their closing quote outside;
+ * - plural possessives (dogs') — unless the apostrophe closes a single quote
+ *   opened earlier in the paragraph, so ‘yes’, 'los gatos' and
+ *   ‘Stop. Look at the bosses’ keep their closing quote outside;
  * - digit:digit times (10:30).
  * URLs (scheme, www., or bare domain + path) and emails are blanked before
  * segmenting; dotted tokens ending in a known TLD (x.com) are masked after,
@@ -140,10 +149,15 @@ interface RawSegment {
 export function tokenizeWords(text: string, locale: string): Tokenized {
   const masked = findMasks(text);
   // Blank masked ranges with same-length spaces so offsets are preserved.
-  let blanked = text;
+  const parts: string[] = [];
+  let at = 0;
   for (const m of masked) {
-    blanked = blanked.slice(0, m.start) + ' '.repeat(m.end - m.start) + blanked.slice(m.end);
+    parts.push(text.slice(at, m.start), ' '.repeat(m.end - m.start));
+    at = m.end;
   }
+  parts.push(text.slice(at));
+  const blanked = parts.join('');
+  const closing = closingQuotes(text);
 
   const segmenter = new Intl.Segmenter(locale, { granularity: 'word' });
   const raw: RawSegment[] = [];
@@ -173,7 +187,7 @@ export function tokenizeWords(text: string, locale: string): Tokenized {
       prev && prev.word && APOS.has(cur.text) && prev.end === cur.start &&
       /[sS]$/.test(prev.text) &&
       !(next && next.start === cur.end && next.word) &&
-      !openQuoteBefore(text, cur.start)
+      !closing.has(cur.start)
     ) {
       merged[merged.length - 1] = { ...prev, end: cur.end, text: text.slice(prev.start, cur.end) };
       continue;
@@ -188,8 +202,10 @@ export function tokenizeWords(text: string, locale: string): Tokenized {
   };
   for (const r of merged) {
     if (!r.word) continue;
-    if (DOMAIN_TOKEN.test(r.text) && /\.\p{L}/u.test(r.text)) {
-      const labels = r.text.split('.');
+    const labels = r.text.split('.');
+    // Only dotted tokens ending in a known TLD are domain candidates, so
+    // Node.Js, Ph.D and a.C. stay whole.
+    if (DOMAIN_TOKEN.test(r.text) && /\.\p{L}/u.test(r.text) && TLD_SET.has(labels[labels.length - 1].toLowerCase())) {
       // A missing space after a full stop ("fin.Es", "Italia.It") or an
       // abbreviation ("etc.es"): split into words at the dots.
       const sentenceGlue = labels.some((l, k) => k > 0 && /^\p{Lu}/u.test(l) && /\p{Ll}/u.test(labels[k - 1]));
@@ -202,10 +218,8 @@ export function tokenizeWords(text: string, locale: string): Tokenized {
         }
         continue;
       }
-      if (TLD_SET.has(labels[labels.length - 1].toLowerCase())) {
-        masked.push({ start: r.start, end: r.end, kind: 'domain' });
-        continue;
-      }
+      masked.push({ start: r.start, end: r.end, kind: 'domain' });
+      continue;
     }
     push(r.start, r.end);
   }

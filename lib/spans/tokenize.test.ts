@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
 import { isNumeric, tokenizeWords } from './tokenize';
-import { chunkTokens, numberedInput } from './numbered';
 
 const words = (t: string, loc = 'en') => tokenizeWords(t, loc).tokens.map(x => x.text);
 const expectRoundTrip = (t: string, loc: string) => {
@@ -63,8 +62,6 @@ describe('tokenizeWords', () => {
       ['https://ex.com/a-b?q=1&x=y', 'url'], ['ana.p@correo.es', 'email'], ['www.foo.org/x', 'url'], ['x.com', 'domain'],
     ]);
     expectRoundTrip(text, 'en');
-    const n = numberedInput(text, tokens);
-    expect(n.startsWith('[0]See https://ex.com/a-b?q=1&x=y.')).toBe(true);
   });
 
   it('returns nothing for empty or punctuation-only text', () => {
@@ -73,26 +70,42 @@ describe('tokenizeWords', () => {
   });
 });
 
-describe('numberedInput / chunkTokens', () => {
-  const text = 'Juan come pan y bebe agua. Luego come fruta.';
-
-  it('numbers the whole text', () => {
-    expect(numberedInput(text, tokenizeWords(text, 'es').tokens)).toBe(
-      '[0]Juan [1]come [2]pan [3]y [4]bebe [5]agua. [6]Luego [7]come [8]fruta.',
-    );
+describe('review fixes', () => {
+  it('keeps closing quotes outside the word, also across sentences', () => {
+    expect(words('She said ‘yes’ and left.')).toEqual(['She', 'said', 'yes', 'and', 'left']);
+    expect(words("Dijo 'los gatos' ayer.", 'es')).toEqual(['Dijo', 'los', 'gatos', 'ayer']);
+    expect(words('‘Stop. Look at the bosses’ he said.')).toEqual(['Stop', 'Look', 'at', 'the', 'bosses', 'he', 'said']);
+    expect(words("'Run! The dogs' he yelled.")).toEqual(['Run', 'The', 'dogs', 'he', 'yelled']);
+    expect(words("the dogs' toys. 'Hi' to the cats' owner")).toEqual(['the', "dogs'", 'toys', 'Hi', 'to', 'the', "cats'", 'owner']);
+    // A new paragraph resets quote state.
+    expect(words("'Hi\nthe dogs' toys")).toEqual(['Hi', 'the', "dogs'", 'toys']);
   });
 
-  it('re-indexes a chunk from 0 and keeps absolute offsets', () => {
-    const { tokens } = tokenizeWords(text, 'es');
-    const range = { start: 27, end: text.length };
-    const local = chunkTokens(tokens, range);
-    expect(local.map(t => [t.i, t.text])).toEqual([[0, 'Luego'], [1, 'come'], [2, 'fruta']]);
-    expect(local[0].start).toBe(27);
-    expect(numberedInput(text, local, range)).toBe('[0]Luego [1]come [2]fruta.');
+  it('tokenizes possessive-heavy text in linear time', () => {
+    for (const unit of ["the dogs' ", "'a dogs' "]) {
+      const text = unit.repeat(Math.ceil(12000 / unit.length)).slice(0, 12000);
+      const t0 = performance.now();
+      tokenizeWords(text, 'en');
+      expect(performance.now() - t0).toBeLessThan(150);
+    }
   });
 
-  it('leaves out a token straddling the chunk edge', () => {
-    const { tokens } = tokenizeWords(text, 'es');
-    expect(chunkTokens(tokens, { start: 2, end: 9 }).map(t => t.text)).toEqual(['come']);
+  it('splits glued sentences only for TLD-like endings', () => {
+    expect(words('Llegó al fin.Es tarde.', 'es')).toEqual(['Llegó', 'al', 'fin', 'Es', 'tarde']);
+    expect(words('I like Italia.It was great')).toEqual(['I', 'like', 'Italia', 'It', 'was', 'great']);
+    expect(words('Ver etc.es', 'es')).toEqual(['Ver', 'etc', 'es']);
+    expect(words('a Ph.D student', 'en')).toEqual(['a', 'Ph.D', 'student']);
+    expect(words('en el 200 a.C. y Node.Js', 'es')).toEqual(['en', 'el', '200', 'a.C', 'y', 'Node.Js']);
+    expect(tokenizeWords('Mira elpais.es y x.com hoy', 'es').masked.map(m => m.kind)).toEqual(['domain', 'domain']);
+  });
+
+  it('masks bare domains with a path, ftp, and balanced parentheses', () => {
+    const t = 'Visit example.com/path?q=1 now. ftp://x.org/f (https://es.wikipedia.org/wiki/Foo_(bar)) next';
+    expect(words(t)).toEqual(['Visit', 'now', 'next']);
+    expect(tokenizeWords(t, 'en').masked.map(m => t.slice(m.start, m.end))).toEqual([
+      'example.com/path?q=1', 'ftp://x.org/f', 'https://es.wikipedia.org/wiki/Foo_(bar)',
+    ]);
+    // Known false positive (harmless: masked text is never swapped).
+    expect(words('dos kg.es/mes', 'es')).toEqual(['dos']);
   });
 });

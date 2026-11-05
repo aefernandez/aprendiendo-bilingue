@@ -1,339 +1,184 @@
-// Validator for the model's span items.
+// Validator for the substring span format.
 //
-// TUPLE LAYOUT (indices are chunk-local word indices, ranges INCLUSIVE):
-//   single word:  [s, s, anchor, translation, pos]                 (5 elements)
-//   multi-word:   [s, e, startAnchor, endAnchor, translation, pos] (6 elements)
-// `anchor`/`startAnchor` is word s copied exactly; `endAnchor` is word e.
-// The element count is the discriminator. A 6-tuple with s == e is accepted
-// (endAnchor is then checked against word s). Lenient forms, for models that
-// drop trailing fields: [s, s, anchor, translation] (no pos), and a 5-tuple with
-// e > s whose last element is not a POS code is read as
-// [s, e, startAnchor, endAnchor, translation]. Any other item with e > s carries
-// no end anchor, so its end can't be verified and it is dropped ('endAnchor').
-// Indices may be integers or digit strings ("3"). A non-string or unknown pos
-// keeps the item with `pos: undefined`.
+// ITEM LAYOUT (the model's reply, in text order):
+//   {"i":[["source phrase","translation","pos"], …]}
+// - source phrase: copied character for character from the text, within one sentence;
+// - translation: what replaces it;
+// - pos: one of POS_CODES (lib/pos.ts). `["n"]` is accepted as `"n"`.
+// Extra trailing elements are ignored.
 
 import { isPosCode, type PosCode } from '../pos';
+import { createAligner, type AlignCtx, type AlignFail, type AlignHow } from './align';
 import type { TextRange, WordToken } from './tokenize';
 
-export interface SpanItem {
-  /**
-   * Chunk-local inclusive word indices (into ValidateCtx.tokens). Use the
-   * absolute `start`/`end` offsets once items from several chunks are merged.
-   */
-  startWord: number;
-  endWord: number;
-  /** Absolute UTF-16 offsets into the original text. */
-  start: number;
-  end: number;
+export interface SpanItem extends TextRange {
+  /** Absolute UTF-16 offsets into the original text (start/end from TextRange). */
   source: string;
   translation: string;
-  pos?: PosCode;
+  pos: PosCode;
   /** Translation equals the source: kept, but not swapped. */
   cognate: boolean;
+  how: AlignHow;
 }
 
 export type DropReason =
-  | 'shape' | 'bounds' | 'anchor' | 'endAnchor' | 'numeric' | 'sentence' | 'masked' | 'overlap'
+  | 'shape' // not [string, string, …], or an empty source
+  | 'posAsTranslation' // the translation is a POS tag ("n", "ADJ"): fields shifted
+  | 'pos' // pos missing or not a known code
+  | AlignFail // align | boundary | masked | sentence | overlap
+  | 'noWords' // the phrase has no word token (punctuation only)
+  | 'numeric' // starts or ends on a number
+  | 'protected' // a name or number in the source is missing from the translation
   | 'empty' | 'newline' | 'url' | 'length';
 
 export interface ValidationStats {
   received: number;
   kept: number;
   cognates: number;
-  /** Start anchor matched at the given index. */
-  anchorExact: number;
-  /** Start anchor did not match at the given index (before repair). */
-  anchorMismatch: number;
-  /** Start anchor found at ±1/±2 and the whole item shifted. */
-  anchorRepaired: number;
-  /** Multi-word items whose end anchor matched at e (inclusive end). */
-  endAnchorExact: number;
-  /** Multi-word items whose end anchor matched at e-1 (exclusive end, pulled back). */
-  exclusiveEnds: number;
-  /** End anchor found at e+1 or ±2 and the end moved. */
-  endRepaired: number;
-  /** Chunk-level: most multi-word items used exclusive ends. Only breaks e/e-1 ties. */
-  exclusiveMode: boolean;
+  /** Items whose pos came wrapped as ["n"]. */
+  posWrapped: number;
+  /** How kept-or-later-dropped items were aligned. */
+  aligned: Record<AlignHow, number>;
   dropped: Partial<Record<DropReason, number>>;
 }
 
-export interface ValidateCtx {
-  /** The whole original text (token offsets are absolute). */
-  text: string;
-  /** Chunk tokens, indexed from 0. */
-  tokens: readonly WordToken[];
-  /**
-   * Masked ranges from tokenizeWords (URLs, emails, domains). Required: a span
-   * whose range covers one is dropped, or the swap would delete the URL.
-   */
-  masked: readonly TextRange[];
-  /** Sentence ranges (absolute offsets). Omitted → the chunk is one sentence. */
-  sentences?: readonly TextRange[];
-}
+export type ValidateCtx = AlignCtx;
 
 export interface ValidationResult {
+  /** Kept items sorted by start offset; never overlapping. */
   kept: SpanItem[];
   stats: ValidationStats;
 }
 
 const URLISH = /(?:https?:\/\/|www\.|[\p{L}\p{N}._%+-]+@[\p{L}\p{N}-]+\.)/iu;
-
-/** NFC, lowercase, curly quotes/hyphens straightened, punctuation stripped from the edges. */
-export function normWord(s: string): string {
-  return s
-    .normalize('NFC')
-    .toLocaleLowerCase()
-    .replace(/[’ʼ‘`´]/g, "'")
-    .replace(/[‐‑]/g, '-')
-    .replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');
-}
-
-/**
- * Exact (normalized) match, or the model copied only one part of a merged token:
- * the first part for a start anchor ("well" → well-known), the last part for an
- * end anchor ("known" → well-known).
- */
-export function anchorMatches(
-  anchor: string,
-  token: string,
-  side: 'start' | 'end' = 'start',
-  ignoreAccents = false,
-): boolean {
-  const a = ignoreAccents ? stripAccents(normWord(anchor)) : normWord(anchor);
-  const t = ignoreAccents ? stripAccents(normWord(token)) : normWord(token);
-  if (!a) return false;
-  if (a === t) return true;
-  if (a.length < 2) return false;
-  if (side === 'start') return t.startsWith(a) && /^['-]/.test(t.slice(a.length));
-  return t.endsWith(a) && /['-]$/.test(t.slice(0, t.length - a.length));
-}
-
-function stripAccents(s: string): string {
-  return s.normalize('NFD').replace(/\p{M}+/gu, '').normalize('NFC');
-}
+const POS_TAG = /^(?:adj|adjective|adv|adverb|noun|verb|pron|pronoun|prep|preposition|conj|conjunction|det|determiner|intj|interj|interjection|propn|adp|aux|expr|expression)$/i;
+// English capitalises day and month names; they are translated, not names.
+const CALENDAR_WORDS = new Set([
+  'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday',
+  'january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september',
+  'october', 'november', 'december',
+]);
+const OPENERS = /[«"“‘'¿¡(\[—–-]\s*$/u;
 
 function normPhrase(s: string): string {
   return s.normalize('NFC').toLocaleLowerCase().replace(/[’ʼ‘]/g, "'").replace(/[^\p{L}\p{N}']+/gu, ' ').trim();
 }
 
-/** Sentence id per token: index of the last range starting at or before the token. */
-export function sentenceIndexOf(tokens: readonly WordToken[], sentences?: readonly TextRange[]): number[] {
-  if (!sentences || sentences.length === 0) return tokens.map(() => 0);
-  const sorted = [...sentences].sort((a, b) => a.start - b.start);
-  let s = 0;
-  return tokens.map(t => {
-    while (s + 1 < sorted.length && sorted[s + 1].start <= t.start) s++;
-    return s;
-  });
+function readPos(raw: unknown): { pos?: PosCode; wrapped: boolean } {
+  let p = raw;
+  let wrapped = false;
+  if (Array.isArray(p)) {
+    wrapped = true;
+    p = p[0];
+  }
+  const code = typeof p === 'string' ? p.trim().toLowerCase() : undefined;
+  return { pos: isPosCode(code) ? code : undefined, wrapped };
 }
 
-interface Tuple {
-  s: number;
-  e: number;
-  anchor: string;
-  endAnchor?: string;
-  translation: string;
-  pos?: PosCode;
-}
-
-function toIndex(v: unknown): number | null {
-  if (typeof v === 'number') return Number.isInteger(v) ? v : null;
-  if (typeof v === 'string' && /^\s*\d{1,6}\s*$/.test(v)) return Number(v);
-  return null;
-}
-
-function readTuple(it: unknown): Tuple | null {
-  if (!Array.isArray(it) || it.length < 4 || it.length > 6) return null;
-  const s = toIndex(it[0]);
-  const e = toIndex(it[1]);
-  if (s === null || e === null) return null;
-  const strs = it.slice(2);
-  let anchor: unknown, endAnchor: unknown, translation: unknown, pos: unknown;
-  if (it.length === 6) [anchor, endAnchor, translation, pos] = strs;
-  else if (it.length === 4) [anchor, translation] = strs;
-  else if (e > s && !isPosCode(it[4])) [anchor, endAnchor, translation] = strs;
-  else [anchor, translation, pos] = strs;
-  if (typeof anchor !== 'string' || typeof translation !== 'string') return null;
-  if (endAnchor !== undefined && typeof endAnchor !== 'string') return null;
-  return {
-    s,
-    e,
-    anchor,
-    endAnchor: endAnchor as string | undefined,
-    translation,
-    pos: isPosCode(pos) ? pos : undefined,
-  };
-}
-
-// both = end anchor at e and e-1 (repeated word); exclOrNext = at e-1 and e+1.
-// Both are settled by the chunk mode after every item has been read.
-type EndState = 'inclusive' | 'exclusive' | 'both' | 'exclOrNext' | 'fixed';
-
-interface Candidate {
-  s: number;
-  e: number;
-  translation: string;
-  pos?: PosCode;
-  end: EndState;
+/** The translation is a POS tag rather than a translation (fields shifted or dropped). */
+function looksLikePosTag(translation: string, source: string, rawPos: unknown, length: number): boolean {
+  const t = translation.trim();
+  if (normPhrase(t) === normPhrase(source)) return false;
+  if (POS_TAG.test(t)) return true;
+  // A bare POS code is a real word in some languages (Italian "a", "e"):
+  // only suspicious when it stands where the pos should be.
+  return isPosCode(t) && (length < 3 || t === (Array.isArray(rawPos) ? rawPos[0] : rawPos));
 }
 
 /**
- * Checks raw items against the chunk's tokens. Pure; never throws.
- * Order of checks: shape → start anchor (±1/±2 repair, both ends shifted; equally
- * near twins → drop) → end anchor for multi-word items (e, else e-1 = exclusive
- * end, else e+1, else ±2; equally plausible twins → drop) → bounds → sort →
- * numeric endpoints → sentence crossing → masked range inside → overlap →
- * translation checks → cognate.
+ * Protected tokens inside [start, end): numbers, and capitalised words that
+ * are not sentence-initial, don't follow an opening quote/¿/¡, and aren't
+ * "I" or an English day/month name (so: names).
+ * Each must survive in the translation: a number by its leading digits, a name verbatim.
+ */
+function lostProtected(
+  text: string,
+  inside: readonly WordToken[],
+  firstOfSentence: ReadonlySet<number>,
+  translation: string,
+): boolean {
+  const straight = (x: string) => x.normalize('NFC').replace(/[’ʼ‘]/g, "'");
+  const t = straight(translation);
+  for (const tok of inside) {
+    if (tok.numeric) {
+      const digits = /^\p{Nd}+/u.exec(tok.text)?.[0] ?? tok.text.replace(/\D/g, '');
+      if (digits && !t.includes(digits)) return true;
+      continue;
+    }
+    if (!/^\p{Lu}/u.test(tok.text) || firstOfSentence.has(tok.start)) continue;
+    if (tok.text === 'I' || CALENDAR_WORDS.has(tok.text.toLowerCase())) continue; // English pronoun, days, months
+    if (OPENERS.test(text.slice(Math.max(0, tok.start - 3), tok.start))) continue;
+    if (!t.includes(straight(tok.text))) return true;
+  }
+  return false;
+}
+
+/**
+ * Aligns and checks raw items. Pure; never throws. Per item: shape → POS tag in
+ * the translation slot → pos code → in-order alignment (see align.ts; rejects
+ * token cuts, masked ranges, sentence crossing, overlaps) → word tokens →
+ * numeric endpoints → translation caps (empty, newline, URL/email, > 4×source+20)
+ * → protected names/numbers → cognate (kept, not swapped).
  */
 export function validateItems(items: readonly unknown[], ctx: ValidateCtx): ValidationResult {
   const { text, tokens } = ctx;
-  const n = tokens.length;
-  const sentenceOf = sentenceIndexOf(tokens, ctx.sentences);
+  const aligner = createAligner(ctx);
   const stats: ValidationStats = {
-    received: items.length, kept: 0, cognates: 0,
-    anchorExact: 0, anchorMismatch: 0, anchorRepaired: 0,
-    endAnchorExact: 0, exclusiveEnds: 0, endRepaired: 0, exclusiveMode: false,
+    received: items.length, kept: 0, cognates: 0, posWrapped: 0,
+    aligned: { exact: 0, case: 0, backtrack: 0, jump: 0 },
     dropped: {},
   };
   const drop = (r: DropReason) => {
     stats.dropped[r] = (stats.dropped[r] ?? 0) + 1;
   };
 
-  const cands: Candidate[] = [];
+  const sentenceStarts = (ctx.sentences ?? []).map(s => s.start);
+  const firstOfSentence = new Set<number>();
+  {
+    const starts = [...sentenceStarts, ctx.range?.start ?? 0].sort((a, b) => a - b);
+    let k = 0;
+    for (const s of starts) {
+      while (k < tokens.length && tokens[k].start < s) k++;
+      if (k < tokens.length) firstOfSentence.add(tokens[k].start);
+    }
+  }
+
+  const kept: SpanItem[] = [];
   for (const it of items) {
-    const tup = readTuple(it);
-    if (!tup) {
+    if (!Array.isArray(it) || typeof it[0] !== 'string' || typeof it[1] !== 'string' || !it[0].trim()) {
       drop('shape');
       continue;
     }
-    let { s, e } = tup;
-    if (e < s) {
-      drop('bounds');
+    const source: string = it[0];
+    const translation: string = it[1];
+    if (looksLikePosTag(translation, source, it[2], it.length)) {
+      drop('posAsTranslation');
+      continue;
+    }
+    const { pos, wrapped } = readPos(it[2]);
+    if (wrapped) stats.posWrapped++;
+    if (!pos) {
+      drop('pos');
       continue;
     }
 
-    // Start anchor.
-    const startAt = (k: number) => k >= 0 && k < n && anchorMatches(tup.anchor, tokens[k].text, 'start');
-    // Accent-insensitive only at the given index: in a repair search it could
-    // pick a wrong twin (el/él, si/sí).
-    if (startAt(s) || (s >= 0 && s < n && anchorMatches(tup.anchor, tokens[s].text, 'start', true))) {
-      stats.anchorExact++;
-    } else {
-      stats.anchorMismatch++;
-      let shift = 0;
-      for (const dist of [1, 2]) {
-        const lo = startAt(s - dist);
-        const hi = startAt(s + dist);
-        if (lo && hi) break; // equidistant twins: ambiguous
-        if (lo || hi) {
-          shift = lo ? -dist : dist;
-          break;
-        }
-      }
-      if (!shift) {
-        drop('anchor');
-        continue;
-      }
-      s += shift;
-      e += shift;
-      stats.anchorRepaired++;
-    }
-
-    // End anchor.
-    let end: EndState = 'inclusive';
-    if (tup.endAnchor === undefined) {
-      if (e > s) {
-        drop('endAnchor');
-        continue;
-      }
-    } else {
-      const ea = tup.endAnchor;
-      const endAt = (k: number) => k >= s && k < n && anchorMatches(ea, tokens[k].text, 'end');
-      const atE = endAt(e) || (e >= s && e < n && anchorMatches(ea, tokens[e].text, 'end', true));
-      const atPrev = endAt(e - 1);
-      const atNext = endAt(e + 1);
-      // Same tie rule as the start anchor: equally plausible positions → drop.
-      // e-1 (exclusive end) and e+1 are both one step away; e+1 and e-2 are
-      // both one step from the exclusive reading e-1.
-      if (atE && atPrev) end = 'both';
-      else if (atE) end = 'inclusive';
-      else if (atPrev && atNext) end = 'exclOrNext';
-      else if (atPrev) {
-        end = 'exclusive';
-        e -= 1;
-      } else {
-        let moved = 0;
-        const atPrev2 = endAt(e - 2);
-        if (atNext) moved = atPrev2 ? 0 : 1;
-        else if (atPrev2 !== endAt(e + 2)) moved = atPrev2 ? -2 : 2;
-        if (!moved) {
-          drop('endAnchor');
-          continue;
-        }
-        e += moved;
-        end = 'fixed';
-        stats.endRepaired++;
-      }
-      if (end === 'inclusive' && e > s) stats.endAnchorExact++;
-      if (end === 'exclusive') stats.exclusiveEnds++;
-    }
-
-    if (s < 0 || e >= n || e < s) {
-      drop('bounds');
+    const hit = aligner.align(source);
+    if ('fail' in hit) {
+      drop(hit.fail);
       continue;
     }
-    cands.push({ s, e, translation: tup.translation, pos: tup.pos, end });
-  }
-
-  // Chunk-level mode only resolves items whose end anchor matches both e and e-1
-  // (a repeated word): never overrides an unambiguous end anchor.
-  stats.exclusiveMode = stats.exclusiveEnds >= 2 && stats.exclusiveEnds > stats.endAnchorExact;
-  const resolved: Candidate[] = [];
-  for (const c of cands) {
-    if (c.end === 'both') {
-      if (stats.exclusiveMode) {
-        c.e -= 1;
-        stats.exclusiveEnds++;
-      } else if (c.e > c.s) stats.endAnchorExact++;
-    } else if (c.end === 'exclOrNext') {
-      if (!stats.exclusiveMode) {
-        drop('endAnchor');
-        continue;
-      }
-      c.e -= 1;
-      stats.exclusiveEnds++;
+    stats.aligned[hit.how]++;
+    const inside = tokens.filter(t => t.start >= hit.start && t.end <= hit.end);
+    if (!inside.length) {
+      drop('noWords');
+      continue;
     }
-    resolved.push(c);
-  }
-
-  resolved.sort((a, b) => a.s - b.s || a.e - b.e);
-  const masked = [...ctx.masked].sort((a, b) => a.start - b.start);
-  const kept: SpanItem[] = [];
-  let lastEnd = -1;
-  for (const c of resolved) {
-    const { s, e } = c;
-    // Trimming numeric ends inward duplicated numbers ("a las 10:30h" → "alle 10:30 10:30h"): drop.
-    if (tokens[s].numeric || tokens[e].numeric) {
+    if (inside[0].numeric || inside[inside.length - 1].numeric) {
       drop('numeric');
       continue;
     }
-    if (sentenceOf[s] !== sentenceOf[e]) {
-      drop('sentence');
-      continue;
-    }
-    const start = tokens[s].start;
-    const end = tokens[e].end;
-    if (masked.some(m => m.start < end && m.end > start)) {
-      drop('masked');
-      continue;
-    }
-    if (s <= lastEnd) {
-      drop('overlap');
-      continue;
-    }
-    const source = text.slice(start, end);
-    const t = c.translation.trim();
+    const src = text.slice(hit.start, hit.end);
+    const t = translation.trim();
     if (!t) {
       drop('empty');
       continue;
@@ -346,15 +191,20 @@ export function validateItems(items: readonly unknown[], ctx: ValidateCtx): Vali
       drop('url');
       continue;
     }
-    if (t.length > 4 * source.length + 20) {
+    if (t.length > 4 * src.length + 20) {
       drop('length');
       continue;
     }
-    const cognate = normPhrase(t) === normPhrase(source);
+    const cognate = normPhrase(t) === normPhrase(src);
+    if (!cognate && lostProtected(text, inside, firstOfSentence, t)) {
+      drop('protected');
+      continue;
+    }
     if (cognate) stats.cognates++;
-    kept.push({ startWord: s, endWord: e, start, end, source, translation: t, pos: c.pos, cognate });
-    lastEnd = e;
+    aligner.occupy(hit);
+    kept.push({ start: hit.start, end: hit.end, source: src, translation: t, pos, cognate, how: hit.how });
   }
+  kept.sort((a, b) => a.start - b.start);
   stats.kept = kept.length;
   return { kept, stats };
 }

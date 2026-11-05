@@ -6,10 +6,12 @@ import type { SpanItem } from './validate';
  * are excluded from numerator and denominator. Returns 0 when there are no words.
  *
  * Works on absolute offsets, so `tokens` may be one chunk's tokens or the whole
- * text's, and `kept` may be merged from several chunks (whose word indices are
- * chunk-local and so are not used here).
+ * text's, and `kept` may be merged from several chunks.
  */
-export function coverage(tokens: readonly WordToken[], kept: readonly SpanItem[]): number {
+export function coverage(
+  tokens: readonly WordToken[],
+  kept: readonly Pick<SpanItem, 'start' | 'end' | 'cognate'>[],
+): number {
   const words = tokens.filter(t => !t.numeric);
   if (!words.length) return 0;
   const ranges = kept.filter(k => !k.cognate).sort((a, b) => a.start - b.start);

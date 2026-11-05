@@ -1,39 +1,35 @@
-// Parser for the model's compact reply. See validate.ts for the tuple layout.
+// Parser for the model's compact substring reply:
 //
-//   {"i":[[1,1,"come","mangia","v"],[4,5,"bebe","agua","beve acqua","v"]]}
+//   {"i":[["source phrase","translation","pos"], …]}
 //
-// Shape is NOT checked here: items come back as `unknown` and validateItems
-// does every positional type check.
+// Items come back as `unknown`; validateItems does every type check.
+
+export type ParseMethod = 'json' | 'brackets' | 'regex';
 
 export interface ParsedItems {
   items: unknown[];
-  /** True when the reply was cut off and only complete inner arrays were salvaged. */
+  /** True when the reply was not valid JSON and items were salvaged. */
   truncated: boolean;
+  method: ParseMethod;
 }
 
-/**
- * Strips `<think>…</think>` and code fences, then tries JSON.parse (accepting
- * `{"i":[…]}` or a bare array). If that fails, a string-aware bracket scanner
- * recovers every complete inner array. Returns null when nothing usable is found
- * (including an unclosed `<think>`, or a salvage that recovers no item). A
- * well-formed empty list (`{"i":[]}`) is a success with no items.
- */
-export function parseItems(content: string): ParsedItems | null {
-  let text = content.replace(/<think>[\s\S]*?<\/think>/g, '').replace(/<think>[\s\S]*$/, '');
-  text = text.replace(/```(?:json)?/g, '').trim();
-  try {
-    const v: unknown = JSON.parse(text);
-    const arr = Array.isArray(v) ? v : v && typeof v === 'object' ? (v as { i?: unknown }).i : undefined;
-    if (Array.isArray(arr)) return { items: arr, truncated: false };
-  } catch {
-    // fall through to salvage
-  }
+const STR = String.raw`"(?:[^"\\]|\\.)*"`;
+// One item: ["src","tgt"(, "pos" | , ["pos"…)?. Tolerates a missing "]" anywhere.
+const ITEM_RE = new RegExp(String.raw`\[\s*(${STR})\s*,\s*(${STR})(?:\s*,\s*\[?\s*(${STR}))?`, 'g');
 
-  // Start at the "i" array, else at the first "[" that opens an array of arrays
-  // (so a stray "[1]" in prose is not taken for the item list).
+function stripWrappers(content: string): string {
+  return content
+    .replace(/<think>[\s\S]*?<\/think>/gi, '')
+    .replace(/<think>[\s\S]*$/i, '')
+    .replace(/```(?:json)?/gi, '')
+    .trim();
+}
+
+/** Nested bracket scanner: every complete inner array of the item list. */
+function scanBrackets(text: string): unknown[] {
   const key = text.search(/"i"\s*:\s*\[/);
   const open = key >= 0 ? text.indexOf('[', key) : text.search(/\[\s*\[/);
-  if (open < 0) return null;
+  if (open < 0) return [];
   const items: unknown[] = [];
   let depth = 0;
   let inStr = false;
@@ -47,14 +43,12 @@ export function parseItems(content: string): ParsedItems | null {
       else if (ch === '"') inStr = false;
       continue;
     }
-    if (ch === '"') {
-      inStr = true;
-    } else if (ch === '[') {
+    if (ch === '"') inStr = true;
+    else if (ch === '[') {
       if (depth === 0) elemStart = k;
       depth++;
     } else if (ch === ']') {
-      // Outer array closed but the JSON was otherwise bad (e.g. trailing junk).
-      if (depth === 0) return items.length ? { items, truncated: false } : null;
+      if (depth === 0) break;
       depth--;
       if (depth === 0 && elemStart >= 0) {
         try {
@@ -66,5 +60,47 @@ export function parseItems(content: string): ParsedItems | null {
       }
     }
   }
-  return items.length ? { items, truncated: true } : null;
+  return items;
+}
+
+/** Flat per-item salvage: survives broken nesting (e.g. pos written as `["n"` unclosed). */
+function scanItems(text: string): unknown[] {
+  const out: unknown[] = [];
+  for (const m of text.matchAll(ITEM_RE)) {
+    try {
+      const item: unknown[] = [JSON.parse(m[1]), JSON.parse(m[2])];
+      if (m[3] !== undefined) item.push(JSON.parse(m[3]));
+      out.push(item);
+    } catch {
+      // skip
+    }
+  }
+  return out;
+}
+
+/**
+ * Strips `<think>` blocks (any case) and code fences, then:
+ * 1. JSON.parse, accepting `{"i":[…]}` or a bare array;
+ * 2. else the bracket scanner and the flat per-item regex, keeping whichever
+ *    recovers more items;
+ * 3. else an explicit empty list (`"i": []` or a bare `[]`) is an empty success.
+ * Returns null when nothing usable is found (garbage, or an unclosed `<think>`).
+ */
+export function parseItems(content: string): ParsedItems | null {
+  const text = stripWrappers(content);
+  try {
+    const v: unknown = JSON.parse(text);
+    const arr = Array.isArray(v) ? v : v && typeof v === 'object' ? (v as { i?: unknown }).i : undefined;
+    if (Array.isArray(arr)) return { items: arr, truncated: false, method: 'json' };
+  } catch {
+    // fall through to salvage
+  }
+  const bracketed = scanBrackets(text);
+  const flat = scanItems(text);
+  if (flat.length > bracketed.length) return { items: flat, truncated: true, method: 'regex' };
+  if (bracketed.length) return { items: bracketed, truncated: true, method: 'brackets' };
+  if (/"i"\s*:\s*\[\s*\]/.test(text) || /(?:^|[\s:])\[\s*\](?=\s*$|\s*[.!]?\s*$)/.test(text)) {
+    return { items: [], truncated: false, method: 'json' };
+  }
+  return null;
 }
