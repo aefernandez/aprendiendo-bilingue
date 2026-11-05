@@ -2,31 +2,31 @@ import { describe, expect, it, vi } from 'vitest';
 import { runChunks, type ChunkOutcome } from './chunkRunner';
 import { Diagnostics } from './diagnostics';
 
-type Script = (chunk: number, attempt: number, timeoutMs: number) => Promise<ChunkOutcome<string>>;
+type Script = (chunk: number, attempt: number, timeoutMs: number, signal: AbortSignal) => Promise<ChunkOutcome<string>>;
 
 const ok = (value: string): ChunkOutcome<string> => ({ ok: true, value });
 const err = (retryable = true, retryAfterMs?: number): ChunkOutcome<string> =>
   retryAfterMs === undefined ? { ok: false, reason: 'boom', retryable } : { ok: false, reason: 'boom', retryable, retryAfterMs };
 const after = <T,>(ms: number, value: T) => new Promise<T>((resolve) => setTimeout(() => resolve(value), ms));
 
-function run(n: number, script: Script, opts: { deadlineMs?: number; maxRetries?: number; minRetryMs?: number; firstAttemptMs?: number } = {}) {
+function run(n: number, script: Script, opts: { deadlineMs?: number; maxRetries?: number; minRetryMs?: number; hedgeAfterMs?: number } = {}) {
   vi.spyOn(console, 'warn').mockImplementation(() => {});
   vi.spyOn(console, 'error').mockImplementation(() => {});
   vi.spyOn(console, 'info').mockImplementation(() => {});
   const deadline = opts.deadlineMs ?? 10_000;
   const startedAt = Date.now();
   const diag = new Diagnostics();
-  const calls: { chunk: number; attempt: number; timeoutMs: number; at: number }[] = [];
+  const calls: { chunk: number; attempt: number; timeoutMs: number; at: number; signal: AbortSignal; previous?: unknown }[] = [];
   const chunks = Array.from({ length: n }, (_, i) => i);
   const promise = runChunks(
     chunks,
-    (chunk, attempt, timeoutMs) => {
-      calls.push({ chunk, attempt, timeoutMs, at: Date.now() - startedAt });
-      return script(chunk, attempt, timeoutMs);
+    (chunk, attempt, timeoutMs, signal, previous) => {
+      calls.push({ chunk, attempt, timeoutMs, at: Date.now() - startedAt, signal, previous });
+      return script(chunk, attempt, timeoutMs, signal);
     },
     {
       remaining: () => deadline - (Date.now() - startedAt),
-      firstAttemptMs: opts.firstAttemptMs ?? 8_000,
+      hedgeAfterMs: opts.hedgeAfterMs ?? 8_000,
       maxRetries: opts.maxRetries ?? 2,
       minRetryMs: opts.minRetryMs ?? 100,
       diag,
@@ -93,14 +93,57 @@ describe('runChunks', () => {
     expect(diag.events.some((e) => e.message === '3 of 4 chunks failed, not retrying')).toBe(true);
   });
 
-  it('caps the first attempt timeout and gives the retry what is left', async () => {
+  it('gives the first request the whole budget and a retry what is left', async () => {
     const { promise, calls } = run(1, async (_c, attempt) => (attempt === 1 ? err() : ok('x')), {
       deadlineMs: 1_000,
-      firstAttemptMs: 300,
+      hedgeAfterMs: 300,
     });
     await promise;
-    expect(calls[0].timeoutMs).toBe(300);
+    expect(calls[0].timeoutMs).toBeGreaterThan(990);
     expect(calls[1].timeoutMs).toBeGreaterThan(900);
+    expect(calls[1].previous).toMatchObject({ ok: false, reason: 'boom' });
+  });
+
+  it('hedges a slow request without cancelling it, and keeps the first valid reply', async () => {
+    // The original answers at 250 ms; the hedge (sent at 100 ms) would answer at 400 ms.
+    const { promise, calls } = run(1, (_c, attempt) => after(attempt === 1 ? 250 : 300, ok(`a${attempt}`)), {
+      hedgeAfterMs: 100,
+    });
+    const [result] = await promise;
+    expect(result).toMatchObject({ value: 'a1', attempts: 2, hedged: true });
+    expect(calls[1].at).toBeGreaterThanOrEqual(95);
+    expect(calls[1].at).toBeLessThan(200);
+    expect(calls[1].previous).toBeUndefined();
+    expect(calls[0].signal.aborted).toBe(true); // aborted only after it won (cleanup)
+    expect(calls[1].signal.aborted).toBe(true); // the loser is cancelled
+  });
+
+  it('takes the hedge when it answers first', async () => {
+    const { promise } = run(1, (_c, attempt) => after(attempt === 1 ? 500 : 50, ok(`a${attempt}`)), {
+      hedgeAfterMs: 100,
+    });
+    const [result] = await promise;
+    expect(result.value).toBe('a2');
+    expect(result.ms).toBeLessThan(300);
+  });
+
+  it('waits for the slow original when the hedge fails', async () => {
+    const { promise } = run(1, (_c, attempt) => (attempt === 1 ? after(300, ok('slow')) : after(10, err())), {
+      hedgeAfterMs: 100,
+    });
+    expect((await promise)[0].value).toBe('slow');
+  });
+
+  it('counts hedges against the retry budget', async () => {
+    const { promise, calls } = run(4, (c) => after(200, ok(`v${c}`)), { hedgeAfterMs: 50, maxRetries: 2 });
+    await promise;
+    expect(calls.filter((c) => c.attempt === 2)).toHaveLength(2);
+  });
+
+  it('does not hedge when too little time remains', async () => {
+    const { promise, calls } = run(1, () => after(200, ok('x')), { hedgeAfterMs: 50, deadlineMs: 200, minRetryMs: 180 });
+    await promise;
+    expect(calls).toHaveLength(1);
   });
 
   it('waits Retry-After before retrying, if the budget allows', async () => {

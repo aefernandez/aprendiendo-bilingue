@@ -21,12 +21,20 @@ describe('classifyLlmError', () => {
     });
   });
 
+  it('treats any other 402/403 as a spend limit (e.g. 403 "Key limit exceeded" without limit_source)', () => {
+    expect(classifyLlmError(403, '{"error":{"code":403,"message":"Key limit exceeded"}}', null)).toEqual({
+      kind: 'spend_limit',
+      retryable: false,
+    });
+    expect(classifyLlmError(402, '<html>', null).retryable).toBe(false);
+  });
+
   it('does not retry a 429', () => {
     expect(classifyLlmError(429, '{}', '20')).toEqual({ kind: 'rate_limited', retryable: false, retryAfterMs: 20_000 });
   });
 
   it('retries other errors, as before', () => {
-    for (const status of [400, 401, 402, 404, 500, 502, 503]) {
+    for (const status of [400, 401, 404, 500, 502, 503]) {
       expect(classifyLlmError(status, '<html>', null)).toEqual({ kind: 'other', retryable: true });
     }
   });

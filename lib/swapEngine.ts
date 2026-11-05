@@ -4,7 +4,7 @@ import { reconstructSegments } from './segmenter';
 import { loadLlmConfig, missingKey, type LlmConfig } from './llmConfig';
 import { Diagnostics } from './diagnostics';
 import { chunkText, type TextRange } from './chunker';
-import { runChunks, type ChunkOutcome } from './chunkRunner';
+import { runChunks, type ChunkFailure, type ChunkOutcome } from './chunkRunner';
 import { classifyLlmError } from './llmErrors';
 
 // ---------------------------------------------------------------------------
@@ -135,10 +135,11 @@ export function parseTranslations(content: string, count: number): string[] | nu
 export const SWAP_DEADLINE_MS = 14_000;
 // Don't start a retry unless at least this much of the budget remains.
 const MIN_RETRY_MS = 4_000;
-// A first attempt gets at most this long, so a slow provider leaves time for a
-// retry (which OpenRouter will likely route elsewhere).
-const FIRST_ATTEMPT_MS = 8_000;
-// Retries across all chunks of one request.
+// If a chunk's request hasn't answered after this long, send a second request
+// alongside it (a hedge) and keep whichever valid reply arrives first. The
+// slow request is not cancelled: a reply at 9-13 s still counts, as before.
+export const HEDGE_AFTER_MS = 8_000;
+// Extra requests (retries + hedges) across all chunks of one request.
 const MAX_CHUNK_RETRIES = 2;
 
 // Long texts are split into chunks translated in parallel: one serial call
@@ -146,15 +147,14 @@ const MAX_CHUNK_RETRIES = 2;
 // Estimated output tokens per chunk (see phraseTokens). Texts under this are
 // sent as a single call, exactly as before chunking existed.
 //
-// Tuned live (Nov 2026, Gemma 4 26B): real output is ~0.85× the estimate;
-// fast providers run ~85–130 tok/s, the p90 floor we route to is ~50 tok/s,
-// and the cheapest provider measured 31 tok/s (493 tokens in 15.8 s). 400
-// estimated ≈ 340 real tokens ≈ 4 s fast / 7 s at p90, inside FIRST_ATTEMPT_MS.
+// Tuned live (Nov 2026, Gemma 4 26B): real output is ~0.85-0.9x the
+// estimate; on the providers in PROVIDER_ORDER a 400-estimate chunk (~350
+// real tokens) takes ~1.5-5 s, well inside HEDGE_AFTER_MS.
 export const CHUNK_TARGET_TOKENS = 400;
-// At the 12,000-char cap Level 1 estimates ~7.1K tokens: 16 chunks keeps them
-// near 450. Each call resends the full text (~3.3K input tokens), so the cap
-// costs ~55K input tokens ≈ $0.002–0.004 per request.
-export const MAX_CHUNKS = 16;
+// At the 12,000-char cap Level 1 estimates ~7.1-8.5K tokens: 20 chunks keeps
+// them at ~360-430. Each call resends the full text (~3.3K input tokens), so a
+// capped request costs ~$0.006 (Makora) to ~$0.012 (Parasail), more if hedged.
+export const MAX_CHUNKS = 20;
 
 // Estimated output tokens for one phrase: JSON item overhead plus the
 // translation. Measured ~11 tokens per Level 1 phrase on Gemma 4.
@@ -162,10 +162,20 @@ export function phraseTokens(span: Span): number {
   return 9 + Math.ceil(span.text.length / 3);
 }
 
-// OpenRouter routing: deprioritise (not exclude) endpoints whose p90
-// throughput is under this many tokens/s, so slow providers stop serving the
-// calls that have to finish inside the deadline.
-const PREFERRED_MIN_THROUGHPUT_P90 = 40;
+// OpenRouter routing: try these providers first, in order, then fall back to
+// any other (allow_fallbacks), so routing never fails if they're down. Default
+// routing is price-weighted and picks slow endpoints: live, the same 40-phrase
+// chunk took 1.35 s on Makora vs 15.8 s on PrimeIntellect, and a 33-phrase
+// chunk took 25.5 s on Darkbloom (Nov 2026, google/gemma-4-26b-a4b-it).
+// All three support structured outputs.
+export const PROVIDER_ORDER = ['makora', 'parasail', 'nextbit'];
+
+// Models where `reasoning: {enabled: false}` is safe to send. Reasoning-only
+// models reject it with a 400, so it's sent only for these. Gemma 4 lists
+// reasoning as optional and off by default (OpenRouter get-model).
+function canDisableReasoning(model: string): boolean {
+  return model.startsWith('google/gemma-');
+}
 // Upstream error bodies can be large HTML pages or echo the prompt; log a slice.
 const MAX_LOGGED_BODY_CHARS = 300;
 
@@ -194,15 +204,16 @@ function describeBackend(config: LlmConfig): string {
 /**
  * The chat-completions body for one call. `text` is always the whole input
  * text (the model needs it for agreement); `spans` are only the phrases this
- * call translates. Attempt 2 uses the stricter retry prompt.
+ * call translates. `retryPrompt` adds the stricter instructions, used after
+ * the model returned an unusable reply.
  */
 export function buildRequestBody(
   config: LlmConfig,
   text: string,
   spans: Span[],
-  attempt: number,
+  retryPrompt = false,
 ): Record<string, unknown> {
-  const userMessage = attempt === 1 ? buildUserMessage(text, spans) : buildRetryMessage(text, spans);
+  const userMessage = retryPrompt ? buildRetryMessage(text, spans) : buildUserMessage(text, spans);
   const body: Record<string, unknown> = {
     model: config.model,
     messages: [
@@ -217,23 +228,29 @@ export function buildRequestBody(
     body.provider = {
       // Only route to providers that actually enforce the schema.
       ...(config.structuredOutputs ? { require_parameters: true } : {}),
-      preferred_min_throughput: { p90: PREFERRED_MIN_THROUGHPUT_P90 },
+      order: PROVIDER_ORDER,
+      allow_fallbacks: true,
     };
-    // Gemma 4 doesn't reason by default; say so explicitly so a provider or
-    // model default can't spend the deadline on thinking tokens.
-    body.reasoning = { enabled: false };
+    // Say so explicitly so a provider default can't spend the deadline on
+    // thinking tokens.
+    if (canDisableReasoning(config.model)) body.reasoning = { enabled: false };
   }
   return body;
 }
 
-const fail = (reason: string, retryable = true, retryAfterMs?: number): ChunkOutcome<string[]> =>
-  retryAfterMs === undefined ? { ok: false, reason, retryable } : { ok: false, reason, retryable, retryAfterMs };
+function fail(reason: string, extra: Partial<Omit<ChunkFailure, 'ok' | 'reason'>> = {}): ChunkFailure {
+  const failure: ChunkFailure = { ok: false, reason, retryable: extra.retryable ?? true };
+  if (extra.retryAfterMs !== undefined) failure.retryAfterMs = extra.retryAfterMs;
+  if (extra.invalidReply) failure.invalidReply = true;
+  return failure;
+}
 
 async function callModel(
   config: LlmConfig,
   body: Record<string, unknown>,
   count: number,
   timeoutMs: number,
+  signal: AbortSignal,
   diag: Diagnostics,
   attempt: string,
 ): Promise<ChunkOutcome<string[]>> {
@@ -247,7 +264,7 @@ async function callModel(
   try {
     const response = await fetch(`${config.baseUrl}/chat/completions`, {
       method: 'POST',
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: AbortSignal.any([AbortSignal.timeout(timeoutMs), signal]),
       headers,
       body: JSON.stringify(body),
     });
@@ -260,9 +277,11 @@ async function callModel(
       );
       const kind = classifyLlmError(response.status, errorBody, response.headers.get('retry-after'));
       const after = kind.retryAfterMs === undefined ? '' : `, Retry-After ${Math.round(kind.retryAfterMs / 1000)} s`;
-      if (kind.kind === 'rate_limited') return fail(`rate limited (429${after})`, false);
-      if (kind.kind === 'spend_limit') return fail(`spend limit reached (${kind.limitSource})`, false);
-      if (kind.kind === 'in_flight_budget') return fail(`in-flight budget full${after}`, true, kind.retryAfterMs);
+      if (kind.kind === 'rate_limited') return fail(`rate limited (429${after})`, { retryable: false });
+      if (kind.kind === 'spend_limit') {
+        return fail(`spend limit reached (${kind.limitSource ?? `HTTP ${response.status}`})`, { retryable: false });
+      }
+      if (kind.kind === 'in_flight_budget') return fail(`in-flight budget full${after}`, { retryAfterMs: kind.retryAfterMs });
       return fail(`LLM error ${response.status}`);
     }
 
@@ -287,10 +306,12 @@ async function callModel(
         `${attempt}: couldn't use the model's reply (expected ${count} numbered translations)`,
         content.slice(0, MAX_LOGGED_BODY_CHARS),
       );
-      return fail('unusable reply');
+      return fail('unusable reply', { invalidReply: true });
     }
     return { ok: true, value: translations };
   } catch (err) {
+    // Aborted by the runner because the other request for this chunk won.
+    if (signal.aborted) return fail('cancelled', { retryable: false });
     const name = err instanceof Error ? err.name : 'Error';
     const message = err instanceof Error ? err.message : String(err);
     const reason = name === 'TimeoutError' ? `timed out after ${timeoutMs} ms` : `failed (${name})`;
@@ -406,18 +427,21 @@ export async function swap(text: string, level: Level, options: SwapOptions = {}
 
   const results = await runChunks(
     jobs,
-    (job, attempt, timeoutMs) =>
+    (job, attempt, timeoutMs, signal, previous) =>
       callModel(
         config,
-        buildRequestBody(config, text, job.spans, attempt),
+        // The stricter prompt only helps when the model answered badly; after a
+        // timeout or a 5xx (or for a hedge) the normal prompt is right.
+        buildRequestBody(config, text, job.spans, previous?.invalidReply === true),
         job.spans.length,
         timeoutMs,
+        signal,
         diag,
         attemptLabel(job, attempt),
       ),
     {
       remaining,
-      firstAttemptMs: FIRST_ATTEMPT_MS,
+      hedgeAfterMs: HEDGE_AFTER_MS,
       maxRetries: MAX_CHUNK_RETRIES,
       minRetryMs: Math.min(MIN_RETRY_MS, deadlineMs / 3),
       diag,

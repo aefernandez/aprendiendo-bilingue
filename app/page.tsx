@@ -78,6 +78,21 @@ export default function Home() {
         <p className="text-sm text-gray-500 mt-1">Read anything in Italian, starting today.</p>
       </header>
 
+      {/* Notices live in a region that is always mounted, so screen readers
+          announce them when they appear with the result. */}
+      <div role="status" aria-live="polite">
+        {words && degraded && (
+          <p className="mb-6 rounded-xl bg-gray-100 px-4 py-3 text-sm text-gray-700">
+            We couldn&apos;t mix this text right now, so it&apos;s shown as-is. Please try again in a moment.
+          </p>
+        )}
+        {words && partial && !degraded && (
+          <p className="mb-6 rounded-xl bg-gray-100 px-4 py-3 text-sm text-gray-700">
+            Some passages couldn&apos;t be mixed and are shown as-is.
+          </p>
+        )}
+      </div>
+
       {/* Input view */}
       {!words && !loading && (
         <div className="space-y-6">
@@ -142,18 +157,6 @@ export default function Home() {
               ← New text
             </button>
           </div>
-
-          {degraded && (
-            <p role="status" className="mb-6 rounded-xl bg-gray-100 px-4 py-3 text-sm text-gray-700">
-              We couldn&apos;t mix this text right now, so it&apos;s shown as-is. Please try again in a moment.
-            </p>
-          )}
-
-          {partial && !degraded && (
-            <p role="status" className="mb-6 rounded-xl bg-gray-100 px-4 py-3 text-sm text-gray-700">
-              Some passages couldn&apos;t be mixed in time, so they&apos;re shown as-is. Try again to mix the whole text.
-            </p>
-          )}
 
           <p className="text-lg leading-relaxed text-gray-900">
             {words.map((word, i) => {

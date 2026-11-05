@@ -60,7 +60,12 @@ describe('swap', () => {
     expect(body.model).toBe('google/gemma-4-26b-a4b-it');
     expect(body.response_format.type).toBe('json_schema');
     // Slow providers are deprioritised (not excluded) so calls finish inside the deadline.
-    expect(body.provider).toEqual({ require_parameters: true, preferred_min_throughput: { p90: 40 } });
+    // Fast providers first (live: Makora 1.35 s vs PrimeIntellect 15.8 s), falling back to any.
+    expect(body.provider).toEqual({
+      require_parameters: true,
+      order: ['makora', 'parasail', 'nextbit'],
+      allow_fallbacks: true,
+    });
     expect(body.reasoning).toEqual({ enabled: false });
     expect(body.max_tokens).toBeLessThan(8192);
     expect(requestHeaders(0).Authorization).toBe('Bearer test-key');
@@ -276,7 +281,7 @@ describe('swap (chunked)', () => {
     const [before] = PRE_CHUNKING_BODIES[key];
     const expected = {
       ...before,
-      provider: { ...(before.provider as object), preferred_min_throughput: { p90: 40 } },
+      provider: { ...(before.provider as object), order: ['makora', 'parasail', 'nextbit'], allow_fallbacks: true },
       reasoning: { enabled: false },
     };
     expect(String(fetchMock.mock.calls[0][1]?.body)).toBe(JSON.stringify(expected));
@@ -316,12 +321,19 @@ describe('swap (chunked)', () => {
     const text = longText(6_000);
     const groups = planChunks(text, selectSpans(text, 1));
     expect(groups.length).toBeGreaterThan(2);
-    // First attempts start in chunk order, so call 1 is chunk 2; its retry is the
-    // only call using the retry prompt.
+    // First requests start in chunk order, so call 1 is chunk 2. After a 502
+    // the retry resends the same prompt, so match it by content.
     let call = 0;
+    let failing = '';
     fetchMock.mockImplementation(async (_url, init) => {
-      const isRetry = String(init?.body).includes('Your previous answer was not valid');
-      if (call++ === 1 || isRetry) return new Response('upstream', { status: 502 });
+      const content = JSON.parse(String(init?.body)).messages[1].content as string;
+      const index = call++;
+      if (index === 1) failing = content;
+      // All first requests are sent before any retry. (The repeated test
+      // paragraph can make two chunks' prompts identical, hence the index.)
+      if (index === 1 || (index >= groups.length && content === failing)) {
+        return new Response('upstream', { status: 502 });
+      }
       return echoTranslations(init);
     });
     const result = await swap(text, 1);
@@ -368,5 +380,115 @@ describe('swap (chunked)', () => {
       const bound = chunkBound(text, spans);
       for (const g of groups) expect(g.reduce((n, s) => n + phraseTokens(s), 0)).toBeLessThanOrEqual(bound);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Hedging, spend limits and prompts (review round 1)
+// ---------------------------------------------------------------------------
+
+describe('swap (hedge and stop rules)', () => {
+  beforeEach(() => {
+    vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+    vi.stubGlobal('fetch', fetchMock);
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    fetchMock.mockReset();
+  });
+
+  // Main succeeded here at 9 s with one call. The first request must not be cut
+  // off, and a hedge must go out at ~8 s (fails if the threshold is raised to 14 s).
+  it('still succeeds when a short text takes 9 s, hedging at ~8 s', async () => {
+    const started = Date.now();
+    const sentAt: number[] = [];
+    fetchMock.mockImplementation(
+      (_url, init) =>
+        new Promise((resolve, reject) => {
+          sentAt.push(Date.now() - started);
+          const timer = setTimeout(() => resolve(echoTranslations(init)), 9_000);
+          init?.signal?.addEventListener('abort', () => {
+            clearTimeout(timer);
+            reject(init.signal?.reason);
+          });
+        }),
+    );
+    const result = await swap(TEXT, LEVEL);
+    const elapsed = Date.now() - started;
+    expect(result.degraded).toBe(false);
+    expect(result.segments.some((s) => s.lang === 'target')).toBe(true);
+    expect(elapsed).toBeGreaterThanOrEqual(8_900);
+    expect(elapsed).toBeLessThan(10_500);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(sentAt[1]).toBeGreaterThanOrEqual(7_900);
+    expect(sentAt[1]).toBeLessThan(8_800);
+    expect(result.debug!.some((e) => e.message === '3 phrases is slow; sending a second request alongside it')).toBe(true);
+  }, 20_000);
+
+  it.each([402, 403])('never retries a %s spend limit (openrouter_key_limit)', async (status) => {
+    fetchMock.mockImplementation(
+      async () =>
+        new Response(JSON.stringify({ error: { code: status, message: 'limit', metadata: { limit_source: 'openrouter_key_limit' } } }), {
+          status,
+        }),
+    );
+    const result = await swap(TEXT, LEVEL);
+    expect(result.degraded).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(result.debug!.some((e) => e.message === '3 phrases: spend limit reached (openrouter_key_limit), not retrying')).toBe(true);
+  });
+
+  it('never retries a 403 without limit_source', async () => {
+    fetchMock.mockImplementation(async () => new Response('{"error":{"code":403,"message":"Key limit exceeded"}}', { status: 403 }));
+    const result = await swap(TEXT, LEVEL);
+    expect(result.degraded).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries an in-flight budget 402 after Retry-After', async () => {
+    const started = Date.now();
+    const sentAt: number[] = [];
+    fetchMock.mockImplementation(async (_url, init) => {
+      sentAt.push(Date.now() - started);
+      if (sentAt.length === 1) {
+        return new Response(
+          JSON.stringify({ error: { code: 402, metadata: { limit_source: 'openrouter_in_flight_budget' } } }),
+          { status: 402, headers: { 'Retry-After': '1' } },
+        );
+      }
+      return echoTranslations(init);
+    });
+    const result = await swap(TEXT, LEVEL);
+    expect(result.degraded).toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(sentAt[1]).toBeGreaterThanOrEqual(950);
+  });
+
+  it('resends the normal prompt after a 5xx, and the strict prompt after an unusable reply', async () => {
+    fetchMock
+      .mockResolvedValueOnce(new Response('upstream', { status: 502 }))
+      .mockImplementationOnce(async (_url, init) => echoTranslations(init));
+    await swap(TEXT, LEVEL);
+    expect(requestBody(1).messages).toEqual(requestBody(0).messages);
+
+    fetchMock.mockReset();
+    fetchMock
+      .mockResolvedValueOnce(completion('{"translations":[]}'))
+      .mockImplementationOnce(async (_url, init) => echoTranslations(init));
+    await swap(TEXT, LEVEL);
+    expect(requestBody(1).messages[1].content).toContain('Your previous answer was not valid');
+  });
+
+  it('only disables reasoning for models where that is safe', async () => {
+    vi.stubEnv('LLM_MODEL', 'anthropic/claude-sonnet-5.5');
+    fetchMock.mockImplementation(async (_url, init) => echoTranslations(init));
+    await swap(TEXT, LEVEL);
+    expect(requestBody(0).reasoning).toBeUndefined();
   });
 });

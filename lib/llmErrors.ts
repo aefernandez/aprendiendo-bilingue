@@ -4,6 +4,8 @@
 //   resolve within a request: never retried.
 // - openrouter_in_flight_budget clears as other requests finish: retryable
 //   after Retry-After.
+// - Any other 402/403 is treated as a spend limit too (e.g. a 403 "Key limit
+//   exceeded" without limit_source, or out of credits): retrying can't help.
 // - 429 (rate limited): not retried. Retrying inside the same few seconds only
 //   adds load, and Retry-After is usually longer than our budget.
 // - Everything else (5xx, 404, 401, bad bodies…): retryable, as before.
@@ -53,6 +55,7 @@ export function classifyLlmError(status: number, body: string, retryAfterHeader:
     if (limitSource === 'openrouter_in_flight_budget') {
       return { kind: 'in_flight_budget', retryable: true, retryAfterMs, limitSource };
     }
+    return limitSource ? { kind: 'spend_limit', retryable: false, limitSource } : { kind: 'spend_limit', retryable: false };
   }
   if (status === 429) return { kind: 'rate_limited', retryable: false, retryAfterMs };
   return { kind: 'other', retryable: true };
