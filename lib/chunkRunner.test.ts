@@ -16,12 +16,12 @@ function run(n: number, script: Script, opts: { deadlineMs?: number; maxRetries?
   const deadline = opts.deadlineMs ?? 10_000;
   const startedAt = Date.now();
   const diag = new Diagnostics();
-  const calls: { chunk: number; attempt: number; timeoutMs: number; at: number; signal: AbortSignal; previous?: unknown }[] = [];
+  const calls: { chunk: number; attempt: number; timeoutMs: number; at: number; signal: AbortSignal; previous?: unknown; kind?: string }[] = [];
   const chunks = Array.from({ length: n }, (_, i) => i);
   const promise = runChunks(
     chunks,
-    (chunk, attempt, timeoutMs, signal, previous) => {
-      calls.push({ chunk, attempt, timeoutMs, at: Date.now() - startedAt, signal, previous });
+    (chunk, attempt, timeoutMs, signal, previous, kind) => {
+      calls.push({ chunk, attempt, timeoutMs, at: Date.now() - startedAt, signal, previous, kind });
       return script(chunk, attempt, timeoutMs, signal);
     },
     {
@@ -167,5 +167,42 @@ describe('runChunks', () => {
       return ok('x');
     });
     expect((await promise).map((r) => r.value)).toEqual([null, 'x']);
+  });
+
+  it('labels each request as first, retry or hedge', async () => {
+    const retry = run(1, async (_c, attempt) => (attempt === 1 ? err() : ok('x')));
+    await retry.promise;
+    expect(retry.calls.map((c) => c.kind)).toEqual(['first', 'retry']);
+    const hedge = run(1, (_c, attempt) => after(attempt === 1 ? 200 : 300, ok('x')), { hedgeAfterMs: 50 });
+    await hedge.promise;
+    expect(hedge.calls.map((c) => c.kind)).toEqual(['first', 'hedge']);
+  });
+
+  // Kills: removing the `brokenDown()` guard from the hedge timer.
+  it('sends no hedge once the failure breaker has tripped', async () => {
+    // Chunks 0-2 fail for good at once (3 of 4 > half); chunk 3 is slow.
+    const { promise, calls, diag } = run(4, (c) => (c < 3 ? Promise.resolve(err(false)) : after(300, ok('slow'))), {
+      hedgeAfterMs: 100,
+      maxRetries: 10,
+    });
+    const results = await promise;
+    expect(results.map((r) => r.value)).toEqual([null, null, null, 'slow']);
+    expect(calls).toHaveLength(4);
+    expect(calls.some((c) => c.kind === 'hedge')).toBe(false);
+    expect(diag.events.some((e) => e.message.includes('is slow'))).toBe(false);
+  });
+
+  // A hedge that fails fast while its original is still running has not made
+  // the chunk fail, so it must not feed the breaker (and block later hedges).
+  it('does not count a fast-failing hedge as a failed chunk', async () => {
+    // Hedge timers fire one after another; each failing hedge settles in a
+    // microtask before the next chunk's timer, so a miscount trips the breaker.
+    const { promise, calls } = run(3, (_c, attempt) => (attempt === 2 ? Promise.resolve(err(false)) : after(300, ok('slow'))), {
+      hedgeAfterMs: 50,
+      maxRetries: 10,
+    });
+    const results = await promise;
+    expect(results.map((r) => r.value)).toEqual(['slow', 'slow', 'slow']);
+    expect(calls.filter((c) => c.kind === 'hedge')).toHaveLength(3);
   });
 });

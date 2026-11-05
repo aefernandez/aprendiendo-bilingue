@@ -15,6 +15,8 @@ export type ChunkFailure = {
   invalidReply?: boolean;
 };
 
+export type AttemptKind = 'first' | 'retry' | 'hedge';
+
 export type ChunkOutcome<T> = { ok: true; value: T } | ChunkFailure;
 
 export interface ChunkResult<T> {
@@ -35,6 +37,9 @@ export type ChunkCall<C, T> = (
   // Why the previous request for this chunk failed (absent for attempt 1
   // and for a hedge).
   previous?: ChunkFailure,
+  // Why this request exists: the first one, a retry after a failure, or a
+  // hedge alongside a slow first request.
+  kind?: AttemptKind,
 ) => Promise<ChunkOutcome<T>>;
 
 export interface RunOptions<C> {
@@ -93,14 +98,14 @@ export async function runChunks<C, T>(
         resolve({ value, attempts, hedged, ms: Date.now() - startedAt });
       };
 
-      const launch = (attempt: number, previous?: ChunkFailure) => {
+      const launch = (attempt: number, kind: AttemptKind, previous?: ChunkFailure) => {
         attempts++;
         inFlight++;
         const controller = new AbortController();
         controllers.push(controller);
         let outcome: Promise<ChunkOutcome<T>>;
         try {
-          outcome = call(chunk, attempt, Math.max(1, opts.remaining()), controller.signal, previous);
+          outcome = call(chunk, attempt, Math.max(1, opts.remaining()), controller.signal, previous, kind);
         } catch (err) {
           outcome = Promise.reject(err);
         }
@@ -120,12 +125,13 @@ export async function runChunks<C, T>(
       };
 
       const onFailure = (failure: ChunkFailure) => {
+        // The other request (hedge or original) is still running: wait for it.
+        // The chunk hasn't failed yet, so it doesn't count toward the breaker.
+        if (inFlight > 0) return;
         if (!countedFailure) {
           countedFailure = true;
           failed++;
         }
-        // The other request (hedge or original) is still running: wait for it.
-        if (inFlight > 0) return;
         if (attempts >= 2) return finish(null);
 
         clearTimeout(hedgeTimer);
@@ -145,7 +151,7 @@ export async function runChunks<C, T>(
           retriesUsed++;
           const retry = () => {
             opts.diag.warn(`Retrying ${label.toLowerCase()}`);
-            launch(2, failure);
+            launch(2, 'retry', failure);
           };
           if (delay > 0) setTimeout(retry, delay);
           else retry();
@@ -162,10 +168,10 @@ export async function runChunks<C, T>(
         retriesUsed++;
         hedged = true;
         opts.diag.warn(`${label} is slow; sending a second request alongside it`);
-        launch(2);
+        launch(2, 'hedge');
       }, opts.hedgeAfterMs);
 
-      launch(1);
+      launch(1, 'first');
     });
 
   return Promise.all(chunks.map(runOne));

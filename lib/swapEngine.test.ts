@@ -491,4 +491,139 @@ describe('swap (hedge and stop rules)', () => {
     await swap(TEXT, LEVEL);
     expect(requestBody(0).reasoning).toBeUndefined();
   });
+
+  it('only disables reasoning for Gemma 4, not older Gemma', async () => {
+    fetchMock.mockImplementation(async (_url, init) => echoTranslations(init));
+    for (const [model, expected] of [
+      ['google/gemma-4-31b-it', { enabled: false }],
+      ['google/gemma-3-27b-it', undefined],
+      ['google/gemma-2-9b-it', undefined],
+    ] as const) {
+      fetchMock.mockClear();
+      vi.stubEnv('LLM_MODEL', model);
+      await swap(TEXT, LEVEL);
+      expect(requestBody(0).reasoning, model).toEqual(expected);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Provider spread (review round 2)
+// ---------------------------------------------------------------------------
+
+describe('swap (provider spread)', () => {
+  beforeEach(() => {
+    vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+    vi.stubGlobal('fetch', fetchMock);
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    fetchMock.mockReset();
+  });
+
+  const providerOf = (call: number) => requestBody(call).provider as Record<string, unknown>;
+
+  it('alternates the first provider by chunk index, keeping fallbacks and required parameters', async () => {
+    fetchMock.mockImplementation(async (_url, init) => echoTranslations(init));
+    await swap(longText(10_000), 1);
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(2);
+    // Calls start in chunk order (synchronously), so call i is chunk i + 1.
+    fetchMock.mock.calls.forEach((_c, i) => {
+      expect(providerOf(i)).toEqual({
+        require_parameters: true,
+        order: i % 2 === 0 ? ['makora', 'parasail', 'nextbit'] : ['parasail', 'makora', 'nextbit'],
+        allow_fallbacks: true,
+      });
+    });
+  });
+
+  it('keeps the original order for a single-chunk text', async () => {
+    fetchMock.mockImplementation(async (_url, init) => echoTranslations(init));
+    await swap(TEXT, LEVEL);
+    expect(providerOf(0).order).toEqual(['makora', 'parasail', 'nextbit']);
+    expect(providerOf(0).ignore).toBeUndefined();
+  });
+
+  it('retries a 5xx on a different provider, but an unusable reply on the same ones', async () => {
+    fetchMock
+      .mockResolvedValueOnce(new Response('upstream', { status: 502 }))
+      .mockImplementationOnce(async (_url, init) => echoTranslations(init));
+    await swap(TEXT, LEVEL);
+    expect(providerOf(1)).toEqual({
+      require_parameters: true,
+      order: ['parasail', 'nextbit'],
+      ignore: ['makora'],
+      allow_fallbacks: true,
+    });
+
+    fetchMock.mockReset();
+    fetchMock
+      .mockResolvedValueOnce(completion('{"translations":[]}'))
+      .mockImplementationOnce(async (_url, init) => echoTranslations(init));
+    await swap(TEXT, LEVEL);
+    expect(providerOf(1)).toEqual(providerOf(0));
+  });
+
+  it('retries an odd chunk away from Parasail', async () => {
+    const text = longText(10_000);
+    let failedOnce = false;
+    fetchMock.mockImplementation(async (_url, init) => {
+      const order = (JSON.parse(String(init?.body)).provider.order as string[])[0];
+      if (order === 'parasail' && !failedOnce) {
+        failedOnce = true;
+        return new Response('upstream', { status: 502 });
+      }
+      return echoTranslations(init);
+    });
+    await swap(text, 1);
+    const retry = fetchMock.mock.calls.map((_c, i) => providerOf(i)).filter((p) => p.ignore);
+    expect(retry).toEqual([{ require_parameters: true, order: ['makora', 'nextbit'], ignore: ['parasail'], allow_fallbacks: true }]);
+  });
+
+  // Also kills: removing the `signal.aborted` guard in callModel, which would
+  // log an AbortError as an error for every hedge that wins.
+  it('sends the hedge to a different provider, and a won hedge leaves no error events', async () => {
+    const started = Date.now();
+    const sentAt: number[] = [];
+    let unhandled = 0;
+    const onUnhandled = () => unhandled++;
+    process.on('unhandledRejection', onUnhandled);
+    fetchMock.mockImplementation(
+      (_url, init) =>
+        new Promise((resolve, reject) => {
+          sentAt.push(Date.now() - started);
+          if (sentAt.length === 1) {
+            // The original hangs until the runner aborts it.
+            init?.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+          } else {
+            resolve(echoTranslations(init));
+          }
+        }),
+    );
+    let result;
+    try {
+      result = await swap(TEXT, LEVEL);
+      await new Promise((r) => setTimeout(r, 20));
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+    expect(result.degraded).toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(sentAt[1]).toBeGreaterThanOrEqual(7_900);
+    expect(providerOf(0).order).toEqual(['makora', 'parasail', 'nextbit']);
+    expect(providerOf(1)).toEqual({
+      require_parameters: true,
+      order: ['parasail', 'nextbit'],
+      ignore: ['makora'],
+      allow_fallbacks: true,
+    });
+    expect(result.debug!.filter((e) => e.level === 'error')).toEqual([]);
+    expect(unhandled).toBe(0);
+  }, 20_000);
 });

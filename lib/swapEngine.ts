@@ -4,7 +4,7 @@ import { reconstructSegments } from './segmenter';
 import { loadLlmConfig, missingKey, type LlmConfig } from './llmConfig';
 import { Diagnostics } from './diagnostics';
 import { chunkText, type TextRange } from './chunker';
-import { runChunks, type ChunkFailure, type ChunkOutcome } from './chunkRunner';
+import { runChunks, type AttemptKind, type ChunkFailure, type ChunkOutcome } from './chunkRunner';
 import { classifyLlmError } from './llmErrors';
 
 // ---------------------------------------------------------------------------
@@ -170,11 +170,23 @@ export function phraseTokens(span: Span): number {
 // All three support structured outputs.
 export const PROVIDER_ORDER = ['makora', 'parasail', 'nextbit'];
 
+// Which providers to try, and in what order, for one request. Chunks alternate
+// their first provider so one slow provider can't stall every chunk, and a
+// hedge or a retry after a timeout/5xx avoids the provider the first request
+// went to (it is the likeliest culprit).
+export function providerRouting(chunkIndex: number, avoidFirst: boolean): { order: string[]; ignore?: string[] } {
+  const primary = chunkIndex % 2 === 0 ? PROVIDER_ORDER : [PROVIDER_ORDER[1], PROVIDER_ORDER[0], ...PROVIDER_ORDER.slice(2)];
+  if (!avoidFirst) return { order: primary };
+  return { order: primary.slice(1), ignore: [primary[0]] };
+}
+
 // Models where `reasoning: {enabled: false}` is safe to send. Reasoning-only
 // models reject it with a 400, so it's sent only for these. Gemma 4 lists
 // reasoning as optional and off by default (OpenRouter get-model).
 function canDisableReasoning(model: string): boolean {
-  return model.startsWith('google/gemma-');
+  // Gemma 3 and 2 don't list `reasoning` as a supported parameter, and
+  // require_parameters would then find no endpoint.
+  return model.startsWith('google/gemma-4-');
 }
 // Upstream error bodies can be large HTML pages or echo the prompt; log a slice.
 const MAX_LOGGED_BODY_CHARS = 300;
@@ -212,6 +224,10 @@ export function buildRequestBody(
   text: string,
   spans: Span[],
   retryPrompt = false,
+  // 0-based position among the chunks of this request; selects the provider order.
+  chunkIndex = 0,
+  // Hedge, or retry after a timeout/5xx: steer away from the first provider.
+  avoidFirstProvider = false,
 ): Record<string, unknown> {
   const userMessage = retryPrompt ? buildRetryMessage(text, spans) : buildUserMessage(text, spans);
   const body: Record<string, unknown> = {
@@ -228,7 +244,7 @@ export function buildRequestBody(
     body.provider = {
       // Only route to providers that actually enforce the schema.
       ...(config.structuredOutputs ? { require_parameters: true } : {}),
-      order: PROVIDER_ORDER,
+      ...providerRouting(chunkIndex, avoidFirstProvider),
       allow_fallbacks: true,
     };
     // Say so explicitly so a provider default can't spend the deadline on
@@ -427,12 +443,20 @@ export async function swap(text: string, level: Level, options: SwapOptions = {}
 
   const results = await runChunks(
     jobs,
-    (job, attempt, timeoutMs, signal, previous) =>
+    (job, attempt, timeoutMs, signal, previous, kind: AttemptKind = 'first') =>
       callModel(
         config,
         // The stricter prompt only helps when the model answered badly; after a
-        // timeout or a 5xx (or for a hedge) the normal prompt is right.
-        buildRequestBody(config, text, job.spans, previous?.invalidReply === true),
+        // timeout or a 5xx (or for a hedge) the normal prompt is right, and
+        // the request goes to a different provider than the first one.
+        buildRequestBody(
+          config,
+          text,
+          job.spans,
+          previous?.invalidReply === true,
+          n === 1 ? 0 : job.index - 1,
+          kind === 'hedge' || (kind === 'retry' && previous?.invalidReply !== true),
+        ),
         job.spans.length,
         timeoutMs,
         signal,
