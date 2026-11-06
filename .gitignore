@@ -13,6 +13,9 @@
 # testing
 /coverage
 
+# eval run output (calls, spend ledger, summaries)
+/eval/results/
+
 # next.js
 /.next/
 /out/

@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "vitest run"
+    "test": "vitest run",
+    "eval": "vitest run --config eval/vitest.config.ts"
   },
   "dependencies": {
     "compromise": "^14.14.0",
