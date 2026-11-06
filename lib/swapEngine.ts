@@ -3,6 +3,9 @@ import { selectSpans } from './tagger';
 import { reconstructSegments } from './segmenter';
 import { loadLlmConfig, missingKey, type LlmConfig } from './llmConfig';
 import { Diagnostics } from './diagnostics';
+import { chunkText, type TextRange } from './chunker';
+import { runChunks, type AttemptKind, type ChunkFailure, type ChunkOutcome } from './chunkRunner';
+import { classifyLlmError } from './llmErrors';
 
 // ---------------------------------------------------------------------------
 // Prompts
@@ -127,11 +130,64 @@ export function parseTranslations(content: string, count: number): string[] | nu
 // Backend call
 // ---------------------------------------------------------------------------
 
-// Total time budget for one swap, across the first call and any retry.
+// Total time budget for one swap, across all calls and any retries.
 // The spec requires results within 15 s; leave headroom for the response.
 export const SWAP_DEADLINE_MS = 14_000;
 // Don't start a retry unless at least this much of the budget remains.
 const MIN_RETRY_MS = 4_000;
+// If a chunk's request hasn't answered after this long, send a second request
+// alongside it (a hedge) and keep whichever valid reply arrives first. The
+// slow request is not cancelled: a reply at 9-13 s still counts, as before.
+export const HEDGE_AFTER_MS = 8_000;
+// Extra requests (retries + hedges) across all chunks of one request.
+const MAX_CHUNK_RETRIES = 2;
+
+// Long texts are split into chunks translated in parallel: one serial call
+// can't produce several thousand output tokens inside the deadline.
+// Estimated output tokens per chunk (see phraseTokens). Texts under this are
+// sent as a single call, exactly as before chunking existed.
+//
+// Tuned live (Nov 2026, Gemma 4 26B): real output is ~0.85-0.9x the
+// estimate; on the providers in PROVIDER_ORDER a 400-estimate chunk (~350
+// real tokens) takes ~1.5-5 s, well inside HEDGE_AFTER_MS.
+export const CHUNK_TARGET_TOKENS = 400;
+// At the 12,000-char cap Level 1 estimates ~7.1-8.5K tokens: 20 chunks keeps
+// them at ~360-430. Each call resends the full text (~3.3K input tokens), so a
+// capped request costs ~$0.006 (Makora) to ~$0.012 (Parasail), more if hedged.
+export const MAX_CHUNKS = 20;
+
+// Estimated output tokens for one phrase: JSON item overhead plus the
+// translation. Measured ~11 tokens per Level 1 phrase on Gemma 4.
+export function phraseTokens(span: Span): number {
+  return 9 + Math.ceil(span.text.length / 3);
+}
+
+// OpenRouter routing: try these providers first, in order, then fall back to
+// any other (allow_fallbacks), so routing never fails if they're down. Default
+// routing is price-weighted and picks slow endpoints: live, the same 40-phrase
+// chunk took 1.35 s on Makora vs 15.8 s on PrimeIntellect, and a 33-phrase
+// chunk took 25.5 s on Darkbloom (Nov 2026, google/gemma-4-26b-a4b-it).
+// All three support structured outputs.
+export const PROVIDER_ORDER = ['makora', 'parasail', 'nextbit'];
+
+// Which providers to try, and in what order, for one request. Chunks alternate
+// their first provider so one slow provider can't stall every chunk, and a
+// hedge or a retry after a timeout/5xx avoids the provider the first request
+// went to (it is the likeliest culprit).
+export function providerRouting(chunkIndex: number, avoidFirst: boolean): { order: string[]; ignore?: string[] } {
+  const primary = chunkIndex % 2 === 0 ? PROVIDER_ORDER : [PROVIDER_ORDER[1], PROVIDER_ORDER[0], ...PROVIDER_ORDER.slice(2)];
+  if (!avoidFirst) return { order: primary };
+  return { order: primary.slice(1), ignore: [primary[0]] };
+}
+
+// Models where `reasoning: {enabled: false}` is safe to send. Reasoning-only
+// models reject it with a 400, so it's sent only for these. Gemma 4 lists
+// reasoning as optional and off by default (OpenRouter get-model).
+function canDisableReasoning(model: string): boolean {
+  // Gemma 3 and 2 don't list `reasoning` as a supported parameter, and
+  // require_parameters would then find no endpoint.
+  return model.startsWith('google/gemma-4-');
+}
 // Upstream error bodies can be large HTML pages or echo the prompt; log a slice.
 const MAX_LOGGED_BODY_CHARS = 300;
 
@@ -157,21 +213,23 @@ function describeBackend(config: LlmConfig): string {
   return `model ${config.model} via ${host}`;
 }
 
-async function callModel(
+/**
+ * The chat-completions body for one call. `text` is always the whole input
+ * text (the model needs it for agreement); `spans` are only the phrases this
+ * call translates. `retryPrompt` adds the stricter instructions, used after
+ * the model returned an unusable reply.
+ */
+export function buildRequestBody(
   config: LlmConfig,
-  userMessage: string,
+  text: string,
   spans: Span[],
-  timeoutMs: number,
-  diag: Diagnostics,
-  attempt: string,
-): Promise<string[] | null> {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
-  if (config.isOpenRouter) {
-    headers['HTTP-Referer'] = 'https://aprendiendo-bilingue.vercel.app';
-    headers['X-Title'] = 'Aprendiendo Bilingue';
-  }
-
+  retryPrompt = false,
+  // 0-based position among the chunks of this request; selects the provider order.
+  chunkIndex = 0,
+  // Hedge, or retry after a timeout/5xx: steer away from the first provider.
+  avoidFirstProvider = false,
+): Record<string, unknown> {
+  const userMessage = retryPrompt ? buildRetryMessage(text, spans) : buildUserMessage(text, spans);
   const body: Record<string, unknown> = {
     model: config.model,
     messages: [
@@ -181,16 +239,48 @@ async function callModel(
     temperature: 0,
     max_tokens: maxTokensFor(spans),
   };
-  if (config.structuredOutputs) {
-    body.response_format = RESPONSE_FORMAT;
-    // Only route to OpenRouter providers that actually enforce the schema.
-    if (config.isOpenRouter) body.provider = { require_parameters: true };
+  if (config.structuredOutputs) body.response_format = RESPONSE_FORMAT;
+  if (config.isOpenRouter) {
+    body.provider = {
+      // Only route to providers that actually enforce the schema.
+      ...(config.structuredOutputs ? { require_parameters: true } : {}),
+      ...providerRouting(chunkIndex, avoidFirstProvider),
+      allow_fallbacks: true,
+    };
+    // Say so explicitly so a provider default can't spend the deadline on
+    // thinking tokens.
+    if (canDisableReasoning(config.model)) body.reasoning = { enabled: false };
+  }
+  return body;
+}
+
+function fail(reason: string, extra: Partial<Omit<ChunkFailure, 'ok' | 'reason'>> = {}): ChunkFailure {
+  const failure: ChunkFailure = { ok: false, reason, retryable: extra.retryable ?? true };
+  if (extra.retryAfterMs !== undefined) failure.retryAfterMs = extra.retryAfterMs;
+  if (extra.invalidReply) failure.invalidReply = true;
+  return failure;
+}
+
+async function callModel(
+  config: LlmConfig,
+  body: Record<string, unknown>,
+  count: number,
+  timeoutMs: number,
+  signal: AbortSignal,
+  diag: Diagnostics,
+  attempt: string,
+): Promise<ChunkOutcome<string[]>> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
+  if (config.isOpenRouter) {
+    headers['HTTP-Referer'] = 'https://aprendiendo-bilingue.vercel.app';
+    headers['X-Title'] = 'Aprendiendo Bilingue';
   }
 
   try {
     const response = await fetch(`${config.baseUrl}/chat/completions`, {
       method: 'POST',
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: AbortSignal.any([AbortSignal.timeout(timeoutMs), signal]),
       headers,
       body: JSON.stringify(body),
     });
@@ -201,7 +291,14 @@ async function callModel(
         `${attempt}: LLM error ${response.status} from ${config.model}`,
         errorBody.slice(0, MAX_LOGGED_BODY_CHARS),
       );
-      return null;
+      const kind = classifyLlmError(response.status, errorBody, response.headers.get('retry-after'));
+      const after = kind.retryAfterMs === undefined ? '' : `, Retry-After ${Math.round(kind.retryAfterMs / 1000)} s`;
+      if (kind.kind === 'rate_limited') return fail(`rate limited (429${after})`, { retryable: false });
+      if (kind.kind === 'spend_limit') {
+        return fail(`spend limit reached (${kind.limitSource ?? `HTTP ${response.status}`})`, { retryable: false });
+      }
+      if (kind.kind === 'in_flight_budget') return fail(`in-flight budget full${after}`, { retryAfterMs: kind.retryAfterMs });
+      return fail(`LLM error ${response.status}`);
     }
 
     const raw = await response.text();
@@ -210,30 +307,85 @@ async function callModel(
       data = JSON.parse(raw);
     } catch {
       diag.error(`${attempt}: LLM returned a non-JSON response`, raw.slice(0, MAX_LOGGED_BODY_CHARS));
-      return null;
+      return fail('non-JSON response');
     }
     const content: unknown = (data as { choices?: { message?: { content?: unknown } }[] })?.choices?.[0]?.message
       ?.content;
     if (typeof content !== 'string' || !content) {
       diag.error(`${attempt}: LLM reply had no message content`, raw.slice(0, MAX_LOGGED_BODY_CHARS));
-      return null;
+      return fail('no message content');
     }
 
-    const translations = parseTranslations(content, spans.length);
+    const translations = parseTranslations(content, count);
     if (!translations) {
       diag.error(
-        `${attempt}: couldn't use the model's reply (expected ${spans.length} numbered translations)`,
+        `${attempt}: couldn't use the model's reply (expected ${count} numbered translations)`,
         content.slice(0, MAX_LOGGED_BODY_CHARS),
       );
+      return fail('unusable reply', { invalidReply: true });
     }
-    return translations;
+    return { ok: true, value: translations };
   } catch (err) {
+    // Aborted by the runner because the other request for this chunk won.
+    if (signal.aborted) return fail('cancelled', { retryable: false });
     const name = err instanceof Error ? err.name : 'Error';
     const message = err instanceof Error ? err.message : String(err);
     const reason = name === 'TimeoutError' ? `timed out after ${timeoutMs} ms` : `failed (${name})`;
     diag.error(`${attempt}: LLM call ${reason}`, message.slice(0, MAX_LOGGED_BODY_CHARS));
-    return null;
+    // A capped first attempt that timed out is worth retrying if time remains;
+    // the runner checks the remaining budget.
+    return fail(`LLM call ${reason}`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Chunking
+// ---------------------------------------------------------------------------
+
+interface ChunkJob {
+  index: number; // 1-based, among chunks that have phrases
+  spans: Span[];
+}
+
+const formatMs = (ms: number) => ms.toLocaleString('en-US');
+
+/** Groups spans (sorted, global offsets) into per-chunk jobs. */
+export function planChunks(text: string, spans: Span[]): Span[][] {
+  // Prefix sums of estimated tokens by span start, so a range's weight is two
+  // binary searches.
+  const starts = spans.map((s) => s.start);
+  const prefix = [0];
+  for (const span of spans) prefix.push(prefix[prefix.length - 1] + phraseTokens(span));
+  const firstAtOrAfter = (position: number) => {
+    let lo = 0;
+    let hi = starts.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (starts[mid] < position) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  };
+  const weight = (r: TextRange) => prefix[firstAtOrAfter(r.end)] - prefix[firstAtOrAfter(r.start)];
+
+  const chunks = chunkText(text, {
+    locale: 'en',
+    target: CHUNK_TARGET_TOKENS,
+    maxChunks: MAX_CHUNKS,
+    weight,
+    protect: spans,
+  });
+
+  // Each span belongs to the chunk containing its start. `protect` keeps spans
+  // from crossing a chunk end, and chunks tile the text, so this is a partition.
+  const groups: Span[][] = [];
+  let next = 0;
+  for (const chunk of chunks) {
+    const group: Span[] = [];
+    while (next < spans.length && spans[next].start < chunk.end) group.push(spans[next++]);
+    if (group.length > 0) groups.push(group);
+  }
+  return groups;
 }
 
 // ---------------------------------------------------------------------------
@@ -269,24 +421,93 @@ export async function swap(text: string, level: Level, options: SwapOptions = {}
     diag.info(`Level ${level}: no phrases selected to swap`);
     return { segments: [{ text, lang: 'source', translation: null }], degraded: false, debug: diag.events };
   }
-  diag.info(`Level ${level}: ${spans.length} phrases → ${describeBackend(config)}`);
-
-  let translations = await callModel(config, buildUserMessage(text, spans), spans, remaining(), diag, 'Attempt 1');
-
-  if (!translations) {
-    if (remaining() < Math.min(MIN_RETRY_MS, deadlineMs / 3)) {
-      diag.error('No time left to retry — returning original text');
-      return fallback(text, diag);
-    }
-    diag.warn(`Retrying ${spans.length} phrases`);
-    translations = await callModel(config, buildRetryMessage(text, spans), spans, remaining(), diag, 'Attempt 2');
+  if (config.model.endsWith(':free')) {
+    diag.warn(`${config.model} is a free model with a per-minute request cap; long texts make up to ${MAX_CHUNKS} calls`);
   }
 
-  if (!translations) {
-    diag.error('No usable translations after retry — returning original text');
+  const jobs: ChunkJob[] = planChunks(text, spans).map((group, i) => ({ index: i + 1, spans: group }));
+  const n = jobs.length;
+  if (n === 1) {
+    diag.info(`Level ${level}: ${spans.length} phrases → ${describeBackend(config)}`);
+  } else {
+    const tokens = spans.reduce((sum, s) => sum + phraseTokens(s), 0);
+    diag.info(
+      `Level ${level}: ${spans.length} phrases in ${n} chunks (~${Math.round(tokens / n)} tokens each) → ${describeBackend(config)}`,
+    );
+  }
+
+  // A single chunk keeps the pre-chunking wording ("Attempt 1", "Retrying 3 phrases").
+  const label = (job: ChunkJob) => (n === 1 ? `${job.spans.length} phrases` : `Chunk ${job.index}/${n}`);
+  const attemptLabel = (job: ChunkJob, attempt: number) =>
+    n === 1 ? `Attempt ${attempt}` : `${label(job)} · attempt ${attempt}`;
+
+  const results = await runChunks(
+    jobs,
+    (job, attempt, timeoutMs, signal, previous, kind: AttemptKind = 'first') =>
+      callModel(
+        config,
+        // The stricter prompt only helps when the model answered badly; after a
+        // timeout or a 5xx (or for a hedge) the normal prompt is right, and
+        // the request goes to a different provider than the first one.
+        buildRequestBody(
+          config,
+          text,
+          job.spans,
+          previous?.invalidReply === true,
+          n === 1 ? 0 : job.index - 1,
+          kind === 'hedge' || (kind === 'retry' && previous?.invalidReply !== true),
+        ),
+        job.spans.length,
+        timeoutMs,
+        signal,
+        diag,
+        attemptLabel(job, attempt),
+      ),
+    {
+      remaining,
+      hedgeAfterMs: HEDGE_AFTER_MS,
+      maxRetries: MAX_CHUNK_RETRIES,
+      minRetryMs: Math.min(MIN_RETRY_MS, deadlineMs / 3),
+      diag,
+      label,
+    },
+  );
+
+  const keptSpans: Span[] = [];
+  const translations: string[] = [];
+  let failedChunks = 0;
+  let failedPhrases = 0;
+  results.forEach((result, i) => {
+    const job = jobs[i];
+    if (result.value) {
+      keptSpans.push(...job.spans);
+      translations.push(...result.value);
+      if (n > 1) diag.info(`${label(job)}: ${job.spans.length} phrases in ${formatMs(result.ms)} ms`);
+    } else {
+      failedChunks++;
+      failedPhrases += job.spans.length;
+    }
+  });
+
+  if (failedChunks === n) {
+    diag.error('No usable translations — returning original text');
     return fallback(text, diag);
   }
 
-  diag.info(`Done in ${Date.now() - startedAt} ms`);
-  return { segments: reconstructSegments(text, spans, translations), degraded: false, debug: diag.events };
+  const partial = failedChunks > 0;
+  if (partial) {
+    diag.warn(
+      `Partial result: ${failedChunks} of ${n} chunks (${failedPhrases} of ${spans.length} phrases) shown as original text`,
+    );
+  }
+  const elapsed = Date.now() - startedAt;
+  diag.info(n === 1 ? `Done in ${elapsed} ms` : `Done in ${formatMs(elapsed)} ms (${n} chunks${partial ? ', partial' : ''})`);
+
+  const result: SwapResult = {
+    segments: reconstructSegments(text, keptSpans, translations),
+    degraded: false,
+    debug: diag.events,
+  };
+  if (partial) result.partial = true;
+  return result;
 }

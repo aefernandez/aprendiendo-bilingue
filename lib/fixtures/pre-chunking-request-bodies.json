@@ -1,0 +1,332 @@
+{
+  "short-L1": [
+    {
+      "model": "google/gemma-4-26b-a4b-it",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a translation engine. Translate English phrases to Italian.\nEach phrase is taken from the full text and its translation will replace it in place, so use the full text for grammatical context — ensure correct tense, gender, and number agreement.\nReturn ONLY a JSON object of the form {\"translations\":[{\"i\":1,\"t\":\"...\"},{\"i\":2,\"t\":\"...\"}]}: one item per numbered phrase, in order, where \"i\" is the phrase number and \"t\" is its Italian translation. Never put the number inside \"t\".\nNo explanation, preamble, or markdown. Only the JSON object."
+        },
+        {
+          "role": "user",
+          "content": "Full text: The dog runs home. The cat sleeps all day.\n\nTranslate each phrase to Italian:\n1. dog runs home\n2. cat sleeps\n3. day\n\nReturn {\"translations\":[...]} with exactly 3 items, numbered 1 to 3."
+        }
+      ],
+      "temperature": 0,
+      "max_tokens": 512,
+      "response_format": {
+        "type": "json_schema",
+        "json_schema": {
+          "name": "translations",
+          "strict": true,
+          "schema": {
+            "type": "object",
+            "properties": {
+              "translations": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "i": {
+                      "type": "integer"
+                    },
+                    "t": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "i",
+                    "t"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": [
+              "translations"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "provider": {
+        "require_parameters": true
+      }
+    }
+  ],
+  "short-L2": [
+    {
+      "model": "google/gemma-4-26b-a4b-it",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a translation engine. Translate English phrases to Italian.\nEach phrase is taken from the full text and its translation will replace it in place, so use the full text for grammatical context — ensure correct tense, gender, and number agreement.\nReturn ONLY a JSON object of the form {\"translations\":[{\"i\":1,\"t\":\"...\"},{\"i\":2,\"t\":\"...\"}]}: one item per numbered phrase, in order, where \"i\" is the phrase number and \"t\" is its Italian translation. Never put the number inside \"t\".\nNo explanation, preamble, or markdown. Only the JSON object."
+        },
+        {
+          "role": "user",
+          "content": "Full text: The dog runs home. The cat sleeps all day.\n\nTranslate each phrase to Italian:\n1. The dog runs home\n2. The cat sleeps all day\n\nReturn {\"translations\":[...]} with exactly 2 items, numbered 1 to 2."
+        }
+      ],
+      "temperature": 0,
+      "max_tokens": 512,
+      "response_format": {
+        "type": "json_schema",
+        "json_schema": {
+          "name": "translations",
+          "strict": true,
+          "schema": {
+            "type": "object",
+            "properties": {
+              "translations": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "i": {
+                      "type": "integer"
+                    },
+                    "t": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "i",
+                    "t"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": [
+              "translations"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "provider": {
+        "require_parameters": true
+      }
+    }
+  ],
+  "short-L3": [
+    {
+      "model": "google/gemma-4-26b-a4b-it",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a translation engine. Translate English phrases to Italian.\nEach phrase is taken from the full text and its translation will replace it in place, so use the full text for grammatical context — ensure correct tense, gender, and number agreement.\nReturn ONLY a JSON object of the form {\"translations\":[{\"i\":1,\"t\":\"...\"},{\"i\":2,\"t\":\"...\"}]}: one item per numbered phrase, in order, where \"i\" is the phrase number and \"t\" is its Italian translation. Never put the number inside \"t\".\nNo explanation, preamble, or markdown. Only the JSON object."
+        },
+        {
+          "role": "user",
+          "content": "Full text: The dog runs home. The cat sleeps all day.\n\nTranslate each phrase to Italian:\n1. The dog runs home\n2. The cat sleeps all day\n\nReturn {\"translations\":[...]} with exactly 2 items, numbered 1 to 2."
+        }
+      ],
+      "temperature": 0,
+      "max_tokens": 512,
+      "response_format": {
+        "type": "json_schema",
+        "json_schema": {
+          "name": "translations",
+          "strict": true,
+          "schema": {
+            "type": "object",
+            "properties": {
+              "translations": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "i": {
+                      "type": "integer"
+                    },
+                    "t": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "i",
+                    "t"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": [
+              "translations"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "provider": {
+        "require_parameters": true
+      }
+    }
+  ],
+  "medium-L1": [
+    {
+      "model": "google/gemma-4-26b-a4b-it",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a translation engine. Translate English phrases to Italian.\nEach phrase is taken from the full text and its translation will replace it in place, so use the full text for grammatical context — ensure correct tense, gender, and number agreement.\nReturn ONLY a JSON object of the form {\"translations\":[{\"i\":1,\"t\":\"...\"},{\"i\":2,\"t\":\"...\"}]}: one item per numbered phrase, in order, where \"i\" is the phrase number and \"t\" is its Italian translation. Never put the number inside \"t\".\nNo explanation, preamble, or markdown. Only the JSON object."
+        },
+        {
+          "role": "user",
+          "content": "Full text: My grandmother lived in a small house near the river. Every morning she walked to the market and bought fresh bread.\n\nShe told me stories about her childhood, about the war and the long winters.\n\nTranslate each phrase to Italian:\n1. My grandmother lived\n2. house\n3. river\n4. morning she walked\n5. market\n6. bought\n7. bread\n8. She told me stories\n9. her childhood\n10. war\n11. winters\n\nReturn {\"translations\":[...]} with exactly 11 items, numbered 1 to 11."
+        }
+      ],
+      "temperature": 0,
+      "max_tokens": 513,
+      "response_format": {
+        "type": "json_schema",
+        "json_schema": {
+          "name": "translations",
+          "strict": true,
+          "schema": {
+            "type": "object",
+            "properties": {
+              "translations": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "i": {
+                      "type": "integer"
+                    },
+                    "t": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "i",
+                    "t"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": [
+              "translations"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "provider": {
+        "require_parameters": true
+      }
+    }
+  ],
+  "medium-L2": [
+    {
+      "model": "google/gemma-4-26b-a4b-it",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a translation engine. Translate English phrases to Italian.\nEach phrase is taken from the full text and its translation will replace it in place, so use the full text for grammatical context — ensure correct tense, gender, and number agreement.\nReturn ONLY a JSON object of the form {\"translations\":[{\"i\":1,\"t\":\"...\"},{\"i\":2,\"t\":\"...\"}]}: one item per numbered phrase, in order, where \"i\" is the phrase number and \"t\" is its Italian translation. Never put the number inside \"t\".\nNo explanation, preamble, or markdown. Only the JSON object."
+        },
+        {
+          "role": "user",
+          "content": "Full text: My grandmother lived in a small house near the river. Every morning she walked to the market and bought fresh bread.\n\nShe told me stories about her childhood, about the war and the long winters.\n\nTranslate each phrase to Italian:\n1. My grandmother lived\n2. a small house\n3. the river\n4. Every morning she walked\n5. the market\n6. bought fresh bread\n7. She told me stories\n8. her childhood\n9. the war\n10. the long winters\n\nReturn {\"translations\":[...]} with exactly 10 items, numbered 1 to 10."
+        }
+      ],
+      "temperature": 0,
+      "max_tokens": 528,
+      "response_format": {
+        "type": "json_schema",
+        "json_schema": {
+          "name": "translations",
+          "strict": true,
+          "schema": {
+            "type": "object",
+            "properties": {
+              "translations": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "i": {
+                      "type": "integer"
+                    },
+                    "t": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "i",
+                    "t"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": [
+              "translations"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "provider": {
+        "require_parameters": true
+      }
+    }
+  ],
+  "medium-L3": [
+    {
+      "model": "google/gemma-4-26b-a4b-it",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a translation engine. Translate English phrases to Italian.\nEach phrase is taken from the full text and its translation will replace it in place, so use the full text for grammatical context — ensure correct tense, gender, and number agreement.\nReturn ONLY a JSON object of the form {\"translations\":[{\"i\":1,\"t\":\"...\"},{\"i\":2,\"t\":\"...\"}]}: one item per numbered phrase, in order, where \"i\" is the phrase number and \"t\" is its Italian translation. Never put the number inside \"t\".\nNo explanation, preamble, or markdown. Only the JSON object."
+        },
+        {
+          "role": "user",
+          "content": "Full text: My grandmother lived in a small house near the river. Every morning she walked to the market and bought fresh bread.\n\nShe told me stories about her childhood, about the war and the long winters.\n\nTranslate each phrase to Italian:\n1. My grandmother lived in a small house near the river\n2. Every morning she walked to the market and bought fresh bread\n3. She told me stories about her childhood\n4. about the war and the long winters\n\nReturn {\"translations\":[...]} with exactly 4 items, numbered 1 to 4."
+        }
+      ],
+      "temperature": 0,
+      "max_tokens": 512,
+      "response_format": {
+        "type": "json_schema",
+        "json_schema": {
+          "name": "translations",
+          "strict": true,
+          "schema": {
+            "type": "object",
+            "properties": {
+              "translations": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "i": {
+                      "type": "integer"
+                    },
+                    "t": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "i",
+                    "t"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": [
+              "translations"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "provider": {
+        "require_parameters": true
+      }
+    }
+  ]
+}
