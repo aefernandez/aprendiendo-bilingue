@@ -35,8 +35,10 @@ export interface ChunkOptions {
 // ---------------------------------------------------------------------------
 
 // A period after one of these is not a sentence end. Matched against the end
-// of a sentence candidate, preceded by start of text or a non-letter.
-// English and Spanish, since B3 reuses this for both.
+// of a sentence candidate, preceded by start of text or a non-letter, whatever
+// follows. English and Spanish, since B3 reuses this for both.
+// Leave out common words that end sentences ("no.", "fig.", "cap.", "aprox."):
+// Intl already keeps "fig. 3" or "aprox. 5" together, so they only add merges.
 const ABBREVIATIONS = [
   'Mr.', 'Mrs.', 'Ms.', 'Dr.', 'Dra.', 'Prof.', 'Sr.', 'Sra.', 'Srta.', 'Jr.', 'St.', 'Sto.', 'Sta.',
   'Ud.', 'Uds.', 'vs.', 'etc.', 'approx.', 'e.g.', 'i.e.', 'a.m.', 'p.m.', 'a. m.', 'p. m.', 'p. ej.',
@@ -44,9 +46,9 @@ const ABBREVIATIONS = [
   'Jan.', 'Feb.', 'Mar.', 'Apr.', 'Jun.', 'Jul.', 'Aug.', 'Sep.', 'Sept.', 'Oct.', 'Nov.', 'Dec.',
   'ene.', 'abr.', 'ago.', 'dic.',
   'Capt.', 'Col.', 'Gen.', 'Lt.', 'Sgt.', 'Rev.', 'Gov.', 'Sen.', 'Rep.', 'Hon.', 'Mt.', 'Ft.', 'Ave.', 'Messrs.',
-  'vol.', 'ch.', 'p.', 'pp.', 'fig.', 'no.',
+  'vol.', 'ch.', 'p.', 'pp.',
   'Lic.', 'Ing.', 'Arq.', 'Avda.', 'Av.', 'Dña.', 'Sres.', 'Sras.', 'Excmo.', 'Excma.',
-  'núm.', 'Núm.', 'pág.', 'págs.', 'cap.', 'tel.', 'Cía.', 'aprox.',
+  'núm.', 'Núm.', 'pág.', 'págs.', 'tel.', 'Cía.',
 ];
 
 const BEFORE_ABBREVIATION = /[^\p{L}\p{N}]$/u;
