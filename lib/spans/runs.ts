@@ -13,7 +13,8 @@
 // - Run: a maximal sequence of swapped ranges, sorted by `start`, where the
 //   original text between consecutive ranges is only horizontal whitespace
 //   and/or commas (or nothing). Any other character breaks the run: a word, a
-//   period, semicolon, quote, dash, or a line break. Offsets are absolute, so
+//   period, semicolon, quote, apostrophe, dash, or a line break (CR, LF, VT,
+//   FF, U+2028, U+2029, NEL). Offsets are absolute, so
 //   items merged from several chunks work.
 // - Run length: the sum over its ranges of the word-token count of the
 //   TRANSLATION (what the reader sees), via tokenizeWords. Numeric tokens are
@@ -55,8 +56,12 @@ export const LENGTH_RULES: Readonly<Record<Level, LengthRule | null>> = {
   3: null,
 };
 
-// Nothing, horizontal whitespace, commas. Line breaks and everything else break.
-const JOINER = /^[^\S\r\n]*(?:,[^\S\r\n]*)*$/;
+// Nothing, horizontal whitespace (incl. NBSP and other Unicode spaces), commas.
+// Line breaks and everything else break. JS \s also matches VT, FF, U+2028 and
+// U+2029 (line/page/paragraph separators), so they are excluded explicitly;
+// NEL (U+0085) is not in \s and already breaks. Input is assumed to be
+// validateItems() output (non-overlapping, non-empty ranges).
+const JOINER = /^[^\S\r\n\v\f\u2028\u2029]*(?:,[^\S\r\n\v\f\u2028\u2029]*)*$/;
 
 function median(sorted: readonly number[]): number {
   const n = sorted.length;

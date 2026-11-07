@@ -73,6 +73,27 @@ describe('runStats: what makes a run', () => {
     expect(runStats(ok, [k(ok, 'pan', 'pane'), k(ok, 'agua', 'acqua')], 'it').runs).toBe(1);
   });
 
+  it.each([
+    ['NBSP', 1, '\u00a0'],
+    ['narrow NBSP', 1, '\u202f'],
+    ['ideographic space', 1, '\u3000'],
+    ['em space', 1, '\u2003'],
+    ['space-comma', 1, ' ,'],
+    ['double comma', 1, ',,'],
+    ['CR', 2, '\r'],
+    ['VT', 2, '\v'],
+    ['FF', 2, '\f'],
+    ['line separator', 2, '\u2028'],
+    ['paragraph separator', 2, '\u2029'],
+    ['NEL', 2, '\u0085'],
+    ['zero-width space', 2, '\u200b'],
+    ['apostrophe', 2, "'"],
+    ['ideographic comma', 2, '、'],
+  ])('gap of %s gives %i run(s)', (_n, runs, gap) => {
+    const t = `pan${gap}agua`;
+    expect(runStats(t, [k(t, 'pan', 'pane'), k(t, 'agua', 'acqua')], 'it').runs).toBe(runs);
+  });
+
   it('a cognate is excluded from the words and breaks the run', () => {
     const t = 'come una paella enorme ahora';
     const s = runStats(
