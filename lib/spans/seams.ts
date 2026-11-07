@@ -235,10 +235,12 @@ export function dedupePunctuation(
 //
 // FIRES WHEN all of these hold:
 // - p, the word token right before the range, is separated from it by spaces
-//   only, sits in the same sentence and is a SOURCE determiner below;
+//   or tabs only (no line break), sits in the same sentence and is a SOURCE
+//   determiner below;
 // - p is lowercase, or capitalised as the first word of its sentence. A
 //   capitalised p mid-sentence is part of a name or a label ("en La Paz",
-//   "The Hague", "Plan A") and is left alone;
+//   "The Hague", "Plan A") and is left alone. So is a sentence-initial one
+//   followed by a capitalised word ("El Salvador es…", "The Hague is…");
 // - the range's own first word is not a source determiner ("this ⟨the right
 //   way⟩": the translation's article belongs to "the", not to "this");
 // - for forms that are also pronouns, the item's pos is n or a (a noun phrase).
@@ -247,17 +249,22 @@ export function dedupePunctuation(
 //   esos ⟨la semana pasada⟩", "he bought these ⟨la settimana scorsa⟩"); en
 //   "his" is a pronoun ("it was his"). A missing pos is not enough for these;
 // - the translation's first word (nothing but spaces/punctuation before it)
-//   is a TARGET article, or one of the pair-specific forms below.
-// Then the range is extended over p when p is free, else the item is dropped.
+//   is a TARGET determiner; Italian lo/la/le/gli/l', which are also object
+//   clitics ("the ⟨lo sapeva⟩"), count only when the item's pos is n or a.
+// Then, when the translation's determiner is the same KIND as p (see below),
+// the range is extended over p when p is free, else the item is dropped. A
+// different kind is dropped too, and so is a p that follows a predeterminer
+// ("all the", "todos los", "what a"; see PREDETERMINERS).
 //
 // CONTRACTIONS es del / al ("de" + "el", "a" + "el"). They hold a preposition
 // as well as an article, so extending over them is only right when the
 // translation carries both:
 // - it: an articulated preposition of the same preposition (del → del, dello,
-//   della, dell', dei, degli, delle; al → al, allo, alla, all', ai, agli,
-//   alle). "La tapa del ⟨del libro⟩" → extend.
-// - en: of / from + a determiner for del, to / at / into + a determiner for
-//   al. "el centro del ⟨of the town⟩" → extend.
+//   della, dell', dei, degli, delle, or dal… since "de" is also "from"; al →
+//   al, allo, alla, all', ai, agli, alle). "La tapa del ⟨del libro⟩" → extend.
+// - en: of / from / about + "the" for del, to / at / into +
+//   "the" for al (del / al hold "el", so only a definite article matches).
+//   "el centro del ⟨of the town⟩" → extend; "del ⟨of her father⟩" is left alone.
 // - A bare article ("del ⟨il libro⟩") doubles the article but drops "de":
 //   extending would render "La tapa il libro". The item is DROPPED. (The
 //   personal "a" — "vio al ⟨il bambino⟩" — would be right to extend, but it
@@ -270,16 +277,29 @@ export function dedupePunctuation(
 // same when the translation starts with un / una / a, so they are treated as
 // determiners. "un ⟨one year⟩" is not caught (one is not a target article).
 
-const SOURCE_DETERMINERS: Readonly<Record<SourceLang, ReadonlySet<string>>> = {
+type DetKind = 'definite' | 'indefinite' | 'demonstrative' | 'possessive';
+
+/** Word → kind, from space-separated word lists (kept as data, one line per kind). */
+function byKind(lists: Partial<Record<DetKind, string>>): ReadonlyMap<string, DetKind> {
+  return new Map(Object.entries(lists).flatMap(([kind, words]) => words.split(' ').map(w => [w, kind as DetKind] as const)));
+}
+
+const SOURCE_DETERMINERS: Readonly<Record<SourceLang, ReadonlyMap<string, DetKind>>> = {
   // Excluded: that (conjunction / relative), her (object pronoun).
-  en: new Set(['the', 'a', 'an', 'this', 'these', 'those', 'my', 'your', 'his', 'its', 'our', 'their']),
-  // Excluded: lo (clitic / neuter article), le, les (clitics).
-  es: new Set([
-    'el', 'la', 'los', 'las', 'un', 'una', 'unos', 'unas',
-    'este', 'esta', 'estos', 'estas', 'ese', 'esa', 'esos', 'esas', 'aquel', 'aquella', 'aquellos', 'aquellas',
-    'mi', 'mis', 'tu', 'tus', 'su', 'sus', 'nuestro', 'nuestra', 'nuestros', 'nuestras',
-    'vuestro', 'vuestra', 'vuestros', 'vuestras', 'del', 'al',
-  ]),
+  en: byKind({
+    definite: 'the',
+    indefinite: 'a an',
+    demonstrative: 'this these those',
+    possessive: 'my your his its our their',
+  }),
+  // Excluded: lo (clitic / neuter article), le, les (clitics). del / al are
+  // contractions (see above) and are matched separately before the kind check.
+  es: byKind({
+    definite: 'el la los las del al',
+    indefinite: 'un una unos unas',
+    demonstrative: 'este esta estos estas ese esa esos esas aquel aquella aquellos aquellas',
+    possessive: 'mi mis tu tus su sus nuestro nuestra nuestros nuestras vuestro vuestra vuestros vuestras',
+  }),
 };
 
 /** Source forms that are also pronouns: a determiner only when the item's pos is n or a. */
@@ -292,56 +312,89 @@ const PRONOUN_LOOKALIKES: Readonly<Record<SourceLang, ReadonlySet<string>>> = {
   ]),
 };
 
-const TARGET_ARTICLES: Readonly<Record<TargetLang, ReadonlySet<string>>> = {
-  // Possessives follow an article in Italian (il mio), so the article is what is checked.
-  it: new Set([
-    'il', 'lo', 'la', 'i', 'gli', 'le', 'un', 'uno', 'una',
-    'questo', 'questa', 'questi', 'queste', 'quel', 'quello', 'quella', 'quei', 'quegli', 'quelle',
-  ]),
-  en: new Set(['the', 'a', 'an', 'this', 'these', 'those', 'my', 'your', 'his', 'its', 'our', 'their']),
-  es: new Set([...SOURCE_DETERMINERS.es].filter(w => w !== 'del' && w !== 'al')),
+// KIND MATCH. The translation's determiner must be the same kind as p, or the
+// item is DROPPED: extending "su ⟨the house⟩" would render "the house" and
+// silently lose the possessive, "este ⟨the book⟩" the demonstrative, "the ⟨un
+// cane⟩" the definiteness. A learner cannot see that; a doubled "su the house"
+// at least looks wrong, and a drop leaves the source as written. The kinds are
+// coarse on purpose (no person / number / proximity check): "su ⟨her house⟩"
+// and "ese ⟨quel libro⟩" extend. Correct translations that change the kind
+// ("se lavó las ⟨his hands⟩", "el ⟨quello che⟩ llega") drop: an accepted miss.
+//
+// Target words that are only safe after a matching p ("that" is also a
+// conjunction, "her" an object pronoun, "some" a quantifier) are safe here
+// because the kind must match p's.
+const TARGET_DETERMINERS: Readonly<Record<TargetLang, ReadonlyMap<string, DetKind>>> = {
+  it: byKind({
+    definite: 'il lo la i gli le',
+    indefinite: 'un uno una dei degli delle alcuni alcune',
+    demonstrative: 'questo questa questi queste quel quello quella quei quegli quelle',
+    // Bare possessive: family nouns ("mia madre"). Not "loro" (also "they"): it counts only after an article.
+    possessive: 'mio mia miei mie tuo tua tuoi tue suo sua suoi sue nostro nostra nostri nostre vostro vostra vostri vostre',
+  }),
+  en: byKind({
+    definite: 'the',
+    indefinite: 'a an some',
+    demonstrative: 'this these those that',
+    possessive: 'my your his her its our their',
+  }),
+  es: byKind({
+    definite: 'el la los las',
+    indefinite: 'un una unos unas',
+    demonstrative: 'este esta estos estas ese esa esos esas aquel aquella aquellos aquellas',
+    possessive: 'mi mis tu tus su sus nuestro nuestra nuestros nuestras vuestro vuestra vuestros vuestras',
+  }),
 };
 /** Elided Italian articles and demonstratives: l'acqua, un'amica, quest'anno, quell'uomo. */
-const TARGET_ELIDED: Readonly<Record<TargetLang, readonly string[]>> = {
-  it: ["l'", "un'", "quest'", "quell'"],
+const TARGET_ELIDED: Readonly<Record<TargetLang, readonly (readonly [string, DetKind])[]>> = {
+  it: [["l'", 'definite'], ["un'", 'indefinite'], ["quest'", 'demonstrative'], ["quell'", 'demonstrative']],
   en: [],
   es: [],
 };
+/** Possessives that follow an article: "la mia casa", "il loro cane" count as possessive. */
+const POSSESSIVE_AFTER_ARTICLE: Readonly<Record<TargetLang, ReadonlySet<string>>> = {
+  it: new Set([...TARGET_DETERMINERS.it].filter(([, k]) => k === 'possessive').map(([w]) => w).concat('loro')),
+  en: new Set(),
+  es: new Set(),
+};
 
-const POSSESSIVE_SOURCE = new Set([
-  'my', 'your', 'his', 'its', 'our', 'their',
-  'mi', 'mis', 'tu', 'tus', 'su', 'sus', 'nuestro', 'nuestra', 'nuestros', 'nuestras',
-  'vuestro', 'vuestra', 'vuestros', 'vuestras',
-]);
-// Italian possessive without an article: family nouns ("mia madre"). Not "loro" (also "they").
-const IT_POSSESSIVES = new Set([
-  'mio', 'mia', 'miei', 'mie', 'tuo', 'tua', 'tuoi', 'tue', 'suo', 'sua', 'suoi', 'sue',
-  'nostro', 'nostra', 'nostri', 'nostre', 'vostro', 'vostra', 'vostri', 'vostre',
-]);
-
-/** Pair-specific forms that also count as the translation's own determiner for this p. */
-function pairExtra(p: string, target: TargetLang, w: string): boolean {
-  if (target === 'it') {
-    if (POSSESSIVE_SOURCE.has(p) && IT_POSSESSIVES.has(w)) return true;
-    if ((p === 'unos' || p === 'unas') && ['dei', 'degli', 'delle', 'alcuni', 'alcune'].includes(w)) return true;
-  }
-  if (target === 'en') {
-    if ((p === 'su' || p === 'sus') && w === 'her') return true; // su casa → her house
-    if (['ese', 'esa', 'aquel', 'aquella'].includes(p) && w === 'that') return true;
-    if ((p === 'unos' || p === 'unas') && w === 'some') return true;
-  }
-  return false;
-}
-
-const IT_ARTICULATED: Readonly<Record<'del' | 'al', { words: ReadonlySet<string>; elided: string }>> = {
-  del: { words: new Set(['del', 'dello', 'della', 'dei', 'degli', 'delle']), elided: "dell'" },
-  al: { words: new Set(['al', 'allo', 'alla', 'ai', 'agli', 'alle']), elided: "all'" },
+// Spanish "de" is both "of" (di) and "from" (da): "salió del ⟨dal cinema⟩".
+const IT_ARTICULATED: Readonly<Record<'del' | 'al', readonly string[]>> = {
+  del: ['del', 'dello', 'della', "dell'", 'dei', 'degli', 'delle', 'dal', 'dallo', 'dalla', "dall'", 'dai', 'dagli', 'dalle'],
+  al: ['al', 'allo', 'alla', "all'", 'ai', 'agli', 'alle'],
 };
 const EN_PREPOSITIONS: Readonly<Record<'del' | 'al', ReadonlySet<string>>> = {
-  del: new Set(['of', 'from']),
+  del: new Set(['of', 'from', 'about']),
   al: new Set(['to', 'at', 'into']),
 };
-const EN_AFTER_PREPOSITION = new Set([...TARGET_ARTICLES.en, 'her', 'that']);
+/**
+ * Words that sit before a determiner and belong to it ("all the children",
+ * "todos los niños", "what a day"). Extending over the determiner alone would
+ * strand them before the translation's article ("All ⟨i bambini⟩", "todos
+ * ⟨the children⟩"), so the item is dropped instead.
+ */
+const PREDETERMINERS: Readonly<Record<SourceLang, ReadonlySet<string>>> = {
+  en: new Set(['all', 'both', 'half', 'such', 'what', 'quite', 'rather', 'many', 'twice', 'double']),
+  es: new Set(['todo', 'toda', 'todos', 'todas']),
+};
+
+/** Target determiners that are also another word class (conjunction, pronoun, quantifier): a kind mismatch is a no-op, not a drop. */
+const AMBIGUOUS_TARGET: Readonly<Record<TargetLang, ReadonlySet<string>>> = {
+  it: new Set(),
+  en: new Set(['that', 'her', 'some']),
+  es: new Set(),
+};
+/**
+ * Italian articles that are also object clitics: "the ⟨lo sapeva⟩" (pos v) is a
+ * verb phrase, not "the" + a noun. Like the source look-alikes, they count only
+ * when the item's pos is n or a.
+ */
+const TARGET_CLITIC_LOOKALIKES: Readonly<Record<TargetLang, ReadonlySet<string>>> = {
+  it: new Set(['lo', 'la', 'le', 'gli', "l'"]),
+  en: new Set(),
+  es: new Set(['la', 'las', 'los']),
+};
+
 
 const straight = (s: string) => s.normalize('NFC').toLocaleLowerCase().replace(/[’ʼ‘]/g, "'");
 
@@ -354,8 +407,11 @@ function leadingWords(t: string): string[] {
   return words.slice(0, 2).map(straight);
 }
 
-function isTargetArticle(w: string, target: TargetLang): boolean {
-  return TARGET_ARTICLES[target].has(w) || TARGET_ELIDED[target].some(e => w.startsWith(e) && w.length > e.length);
+/** Kind of the determiner the translation starts with (w1, w2: its first two words), or null. */
+function targetKind(w1: string, w2: string | undefined, target: TargetLang): DetKind | null {
+  const kind = TARGET_DETERMINERS[target].get(w1) ?? TARGET_ELIDED[target].find(([e]) => w1.startsWith(e) && w1.length > e.length)?.[1] ?? null;
+  if ((kind === 'definite' || kind === 'indefinite') && w2 && POSSESSIVE_AFTER_ARTICLE[target].has(w2)) return 'possessive';
+  return kind;
 }
 
 export interface LeftDeterminerArgs {
@@ -373,7 +429,7 @@ export interface LeftDeterminerArgs {
 export interface LeftDeterminer {
   /** The source determiner right before the range. */
   token: WordToken;
-  /** false: extending would lose meaning (del/al before a bare article) — drop instead. */
+  /** false: extending would lose meaning (del/al before a bare article, a determiner of another kind) — drop instead. */
   extend: boolean;
   /** p was capitalised as the first word of its sentence. */
   initial: boolean;
@@ -386,7 +442,7 @@ export function leftDeterminer(a: LeftDeterminerArgs): LeftDeterminer | null {
   if (k < 0) k = tokens.length;
   const p = tokens[k - 1];
   const first = tokens[k];
-  if (!p || p.start < sentence.start || !/^\s+$/u.test(text.slice(p.end, range.start))) return null;
+  if (!p || p.start < sentence.start || !/^[^\S\r\n]+$/u.test(text.slice(p.end, range.start))) return null;
   const w = straight(p.text);
   const dets = SOURCE_DETERMINERS[sourceLang];
   if (!dets.has(w)) return null;
@@ -395,20 +451,31 @@ export function leftDeterminer(a: LeftDeterminerArgs): LeftDeterminer | null {
   const initial = !WORDCHAR.test(text.slice(sentence.start, p.start));
   const capital = /^\p{Lu}/u.test(p.text);
   if (capital && !initial) return null;
+  // "El Salvador", "The Hague", "La Paz" at sentence start: a capitalised p
+  // followed by a capitalised word is likely a name, so it is left alone.
+  if (capital && first && first.start < range.end && /^\p{Lu}/u.test(first.text)) return null;
 
   const [w1, w2] = leadingWords(a.translation);
   if (!w1) return null;
+  const q = tokens[k - 2];
+  const stranded = !!q && q.start >= sentence.start && /^\s+$/u.test(text.slice(q.end, p.start))
+    && PREDETERMINERS[sourceLang].has(straight(q.text));
+  const found = (extend: boolean): LeftDeterminer => ({ token: p, extend: extend && !stranded, initial: capital });
   if (w === 'del' || w === 'al') {
     if (targetLang === 'it') {
-      const art = IT_ARTICULATED[w];
-      if (art.words.has(w1) || (w1.startsWith(art.elided) && w1.length > art.elided.length)) return { token: p, extend: true, initial: capital };
+      if (IT_ARTICULATED[w].some(e => e.endsWith("'") ? w1.startsWith(e) && w1.length > e.length : w1 === e)) return found(true);
     } else if (targetLang === 'en') {
-      if (EN_PREPOSITIONS[w].has(w1) && w2 && EN_AFTER_PREPOSITION.has(w2)) return { token: p, extend: true, initial: capital };
+      if (EN_PREPOSITIONS[w].has(w1) && w2 === 'the') return found(true);
     }
-    return isTargetArticle(w1, targetLang) ? { token: p, extend: false, initial: capital } : null;
+    return targetKind(w1, w2, targetLang) ? found(false) : null;
   }
-  if (isTargetArticle(w1, targetLang) || pairExtra(w, targetLang, w1)) return { token: p, extend: true, initial: capital };
-  return null;
+  const kind = targetKind(w1, w2, targetLang);
+  if (!kind) return null;
+  const clitic = [...TARGET_CLITIC_LOOKALIKES[targetLang]].some(c => c.endsWith("'") ? w1.startsWith(c) : w1 === c);
+  if (clitic && a.pos !== 'n' && a.pos !== 'a') return null;
+  if (kind === dets.get(w)) return found(true);
+  // A different kind: drop, unless the target word is also something else.
+  return AMBIGUOUS_TARGET[targetLang].has(w1) ? null : found(false);
 }
 
 /** Uppercases the translation's first letter (l'acqua → L'acqua). */

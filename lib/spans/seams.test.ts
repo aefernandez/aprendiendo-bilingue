@@ -192,6 +192,79 @@ describe('determiner left before the range', () => {
   });
 });
 
+describe('determiner review fixes (drops and no-ops instead of a wrong repair)', () => {
+  const enIt = { s: 'en', t: 'it' } as const;
+  const esEn = { s: 'es', t: 'en' } as const;
+  const esIt = { s: 'es', t: 'it' } as const;
+
+  // A different kind of determiner: extending would silently swap the meaning.
+  it.each([
+    ['es-en su → the (loses the possessive)', 'Vendió su casa.', esEn, ['casa', 'the house', 'n']],
+    ['es-it su → la (loses the possessive)', 'Vendió su casa.', esIt, ['casa', 'la casa', 'n']],
+    ['es-en este → the (loses the demonstrative)', 'Compré este libro.', esEn, ['libro', 'the book', 'n']],
+    ['en-it the → un (definite → indefinite)', 'She saw the dog.', enIt, ['dog', 'un cane', 'n']],
+    ['en-it a → la (indefinite → definite)', 'He drank a beer.', enIt, ['beer', 'la birra', 'n']],
+    ['en-it my → la madre (loses the possessive)', 'I called my mother.', enIt, ['mother', 'la madre', 'n']],
+    ['en-it the → i suoi (adds a possessive)', 'He saw the friends.', enIt, ['friends', 'i suoi amici', 'n']],
+    ['es-it el → quello (article → demonstrative)', 'El que llega tarde pierde.', esIt, ['que llega tarde', 'quello che arriva tardi', 'x']],
+  ])('drops: %s', (_label, text, langs, item) => {
+    const r = run(text, langs.s, [item], langs);
+    expect(r.kept).toEqual([]);
+    expect(r.stats.dropped).toEqual({ determiner: 1 });
+  });
+
+  it.each([
+    ['es-en su → his', 'Vendió su casa.', esEn, ['casa', 'his house', 'n'], ['su casa', 'his house']],
+    ['es-en su → their', 'Vendieron su casa.', esEn, ['casa', 'their house', 'n'], ['su casa', 'their house']],
+    ['es-it su → la sua (article + possessive)', 'Vendió su casa.', esIt, ['casa', 'la sua casa', 'n'], ['su casa', 'la sua casa']],
+    ['es-it su → la loro', 'Vendieron su casa.', esIt, ['casa', 'la loro casa', 'n'], ['su casa', 'la loro casa']],
+    ['en-it its → la sua', 'The dog wagged its tail.', enIt, ['tail', 'la sua coda', 'n'], ['its tail', 'la sua coda']],
+    ['es-it unas → alcuni', 'Compró unas flores.', esIt, ['flores', 'alcuni fiori', 'n'], ['unas flores', 'alcuni fiori']],
+    ['es-it del → dal (de = from)', 'Salió del cine.', esIt, ['cine', 'dal cinema', 'n'], ['del cine', 'dal cinema']],
+    ['es-en del → about the', 'Habló del viaje.', esEn, ['viaje', 'about the trip', 'n'], ['del viaje', 'about the trip']],
+  ])('extends: %s', (_label, text, langs, item, expected) => {
+    const r = run(text, langs.s, [item], langs);
+    expect(pairs(r)).toEqual([expected]);
+    expect(r.stats.repaired.determiner).toBe(1);
+  });
+
+  it.each([
+    ['en all the', 'All the children ran.', enIt, ['children', 'i bambini', 'n']],
+    ['en both the', 'He saw both the cars.', enIt, ['cars', 'le macchine', 'n']],
+    ['en half the', 'He ate half the cake.', enIt, ['cake', 'la torta', 'n']],
+    ['en what a', 'What a day!', enIt, ['day', 'una giornata', 'n']],
+    ['en such a', 'It was such a day.', enIt, ['day', 'una giornata', 'n']],
+    ['es todos los → the', 'Vinieron todos los niños.', esEn, ['niños', 'the children', 'n']],
+    ['es todos los → i', 'Todos los niños corrieron.', esIt, ['niños', 'i bambini', 'n']],
+  ])('drops after a predeterminer it would strand: %s', (_label, text, langs, item) => {
+    const r = run(text, langs.s, [item], langs);
+    expect(r.kept).toEqual([]);
+    expect(r.stats.dropped).toEqual({ determiner: 1 });
+  });
+
+  it.each([
+    ['it clitic lo (pos v)', 'He knew the answer.', enIt, ['answer', 'lo sapeva', 'v']],
+    ['it clitic la (pos v)', 'He had a look.', enIt, ['look', 'la guardò', 'v']],
+    ['it clitic le (pos x)', 'He gave the girl a book.', enIt, ['girl a book', 'le diede un libro', 'x']],
+    ['it clitic gli (pos v)', 'He told the kids.', enIt, ['kids', 'gli ha detto', 'v']],
+    ['es-en del → of her (del is definite; no possessive added)', 'La casa del padre.', esEn, ['padre', 'of her father', 'n']],
+    ['en her is also a pronoun: kind mismatch is a no-op', 'Vio la casa.', esEn, ['casa', 'her house', 'n']],
+    ['sentence-initial El + capitalised name', 'El Salvador es pequeño.', esIt, ['Salvador es pequeño', 'il Salvador è piccolo', 'x']],
+    ['line break between determiner and range', 'He sat on the\nsofa and slept.', enIt, ['sofa', 'il divano', 'n']],
+  ])('no change: %s', (_label, text, langs, item) => {
+    const r = run(text, langs.s, [item], langs);
+    expect(pairs(r)).toEqual([[item[0], item[1]]]);
+    expect(r.stats.repaired.determiner).toBe(0);
+  });
+
+  it('line break: also without a sentence list', () => {
+    const text = 'He sat on the\nsofa.';
+    const { tokens, masked } = tokenizeWords(text, 'en');
+    const r = validateItems([['sofa', 'il divano', 'n']], { text, tokens, masked, sourceLang: 'en', targetLang: 'it' });
+    expect(r.kept.map(k => k.source)).toEqual(['sofa']);
+  });
+});
+
 describe('spike replies: zero seam repairs', () => {
   const DIR = fileURLToPath(new URL('./__fixtures__/spike/', import.meta.url));
   const files = readdirSync(DIR).filter(f => f.endsWith('.txt')).sort();
