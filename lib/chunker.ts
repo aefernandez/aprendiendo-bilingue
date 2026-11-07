@@ -43,6 +43,10 @@ const ABBREVIATIONS = [
   'EE.', 'UU.', 'EE. UU.', 'No.', 'Nos.',
   'Jan.', 'Feb.', 'Mar.', 'Apr.', 'Jun.', 'Jul.', 'Aug.', 'Sep.', 'Sept.', 'Oct.', 'Nov.', 'Dec.',
   'ene.', 'abr.', 'ago.', 'dic.',
+  'Capt.', 'Col.', 'Gen.', 'Lt.', 'Sgt.', 'Rev.', 'Gov.', 'Sen.', 'Rep.', 'Hon.', 'Mt.', 'Ft.', 'Ave.', 'Messrs.',
+  'vol.', 'ch.', 'p.', 'pp.', 'fig.', 'no.',
+  'Lic.', 'Ing.', 'Arq.', 'Avda.', 'Av.', 'Dña.', 'Sres.', 'Sras.', 'Excmo.', 'Excma.',
+  'núm.', 'Núm.', 'pág.', 'págs.', 'cap.', 'tel.', 'Cía.', 'aprox.',
 ];
 
 const BEFORE_ABBREVIATION = /[^\p{L}\p{N}]$/u;

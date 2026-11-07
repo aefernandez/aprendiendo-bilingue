@@ -22,6 +22,11 @@ describe('splitSentences', () => {
     ['It took approx. three days. Then rest.', ['It took approx. three days. ', 'Then rest.']],
     ['Fruit, e.g. Apples, is good. Eat it.', ['Fruit, e.g. Apples, is good. ', 'Eat it.']],
     ['Mr. Smith met Dr. Jones at 3 p.m. on Jan. 5. Then he left.', ['Mr. Smith met Dr. Jones at 3 p.m. on Jan. 5. ', 'Then he left.']],
+    ['Capt. Smith, Gen. Lee and Rev. Hale met. Ok.', ['Capt. Smith, Gen. Lee and Rev. Hale met. ', 'Ok.']],
+    ['Mt. Everest is high. Ok.', ['Mt. Everest is high. ', 'Ok.']],
+    ['He read vol. Two and ch. Three today. Ok.', ['He read vol. Two and ch. Three today. ', 'Ok.']],
+    ['They reached the Mount. Then it rained.', ['They reached the Mount. ', 'Then it rained.']],
+    ['Mr. Maxwell came at 9.45 and left. Then he slept.', ['Mr. Maxwell came at 9.45 and left. ', 'Then he slept.']],
   ])('English: %s', (text, expected) => {
     expect(sentencesOf(text)).toEqual(expected);
   });
@@ -32,6 +37,11 @@ describe('splitSentences', () => {
     ['Vivo en EE. UU. Es grande.', ['Vivo en EE. UU. Es grande.']],
     ['Llegó la Sra. Pérez a las 5 p. m. Luego cenamos.', ['Llegó la Sra. Pérez a las 5 p. m. Luego cenamos.']],
     ['Frutas, p. ej. Manzanas. Bien.', ['Frutas, p. ej. Manzanas. ', 'Bien.']],
+    ['El Lic. Pérez y el Ing. Gómez. Luego.', ['El Lic. Pérez y el Ing. Gómez. ', 'Luego.']],
+    ['Vive en la Avda. Mayo. Luego.', ['Vive en la Avda. Mayo. ', 'Luego.']],
+    ['Ver núm. Siete y pág. Cuatro hoy. Bien.', ['Ver núm. Siete y pág. Cuatro hoy. ', 'Bien.']],
+    ['Vio el Ingenio. Luego se fue.', ['Vio el Ingenio. ', 'Luego se fue.']],
+    ['Mide 3,5 m y pesa 4.5 kg. Es grande.', ['Mide 3,5 m y pesa 4.5 kg. ', 'Es grande.']],
   ])('Spanish: %s', (text, expected) => {
     expect(sentencesOf(text, 'es')).toEqual(expected);
   });
